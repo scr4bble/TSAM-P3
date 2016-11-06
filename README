@@ -1,1 +1,15 @@
 Update this.
+
+
+- generating private key (-aes128 option for key encrypted by passphrase)
+openssl genrsa -out fd.key 2048
+
+
+- generating public key from private key:
+openssl rsa -in fd.key -pubout -out fd-public.key
+
+- generating certificate
+openssl req -new -x509 -days 365 -key fd.key -out fd.crt
+
+- printing info about certificate
+openssl x509 -text -in fd.crt -noout

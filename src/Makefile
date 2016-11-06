@@ -1,6 +1,17 @@
 CC = gcc
 CFLAGS = -std=gnu11 -O2 -g -Wall -Wextra -Wformat=2 $(shell pkg-config glib-2.0 openssl --cflags)
 
+SERVER_PORT := 12345
+
+# if "/labs/tsam15/my_port" exists
+ifneq (,$(wildcard /labs/tsam15/my_port))
+	SERVER_PORT := $(/labs/tsam15/my_port)
+endif
+
+.DEFAULT: all
+.PHONY: all post clean
+
+
 all: chatd chat
 
 chat: chat.o getpasswd.o
@@ -14,3 +25,12 @@ clean:
 
 distclean: clean
 	rm -f chatd chat
+
+run-server:
+	./chatd $(SERVER_PORT)
+
+run-client:
+	./chat localhost $(SERVER_PORT)
+
+zip:
+	cd ..; zip chat.zip README src/*.c src/Makefile AUTHORS
