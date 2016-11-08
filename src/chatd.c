@@ -396,31 +396,15 @@ gint fd_cmp(gconstpointer fd1,  gconstpointer fd2, gpointer G_GNUC_UNUSED data)
 }
 
 
-
-
-int main(int argc, char **argv)
+bool start_listening(int server_port)
 {
-	struct sockaddr_in server, client;
-
-	if (argc != 2) {
-		fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-		exit(EXIT_FAILURE);
-	}
-
-	const int server_port = strtol(argv[1], NULL, 10);
-
-	// catch SIGINT
-	if (signal(SIGINT, sig_handler) == SIG_ERR)
-		printf("\nCannot catch SIGINT!\n");
-
-	// create queue for storing client connections
-	clients_queue = g_queue_new();
+	struct sockaddr_in server;
 
 	/* Create and bind a TCP socket */
 	sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sockfd == 0) {
 		perror("socket() failed");
-		return EXIT_FAILURE;
+		return false;
 	}
 
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) < 0)
@@ -435,7 +419,7 @@ int main(int argc, char **argv)
 
 	if (bind(sockfd, (struct sockaddr *) &server, (socklen_t) sizeof(server)) < 0) {
 		perror("bind() failed");
-		return EXIT_FAILURE;
+		return false;
 	}
 
 	/* Before the server can accept messages, it has to listen to the
@@ -443,6 +427,31 @@ int main(int argc, char **argv)
 	printf("Listening on port %d \n", server_port);
 	listen(sockfd, 10);
 	printf("Waiting for connections ...\n\n");
+
+	return true;
+}
+
+
+int main(int argc, char **argv)
+{
+	if (argc != 2) {
+		fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	const int server_port = strtol(argv[1], NULL, 10);
+
+	// catch SIGINT
+	if (signal(SIGINT, sig_handler) == SIG_ERR)
+		printf("\nCannot catch SIGINT!\n");
+
+	// create queue for storing client connections
+	clients_queue = g_queue_new();
+
+	// create socket and start listening
+	if (!start_listening(server_port)) {
+		clean_and_die(1);
+	}
 
 	run_loop();
 

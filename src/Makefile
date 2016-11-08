@@ -9,7 +9,7 @@ ifneq (,$(wildcard /labs/tsam15/my_port))
 endif
 
 .DEFAULT: all
-.PHONY: all post clean
+.PHONY: all post clean run-server run-client zip
 
 
 all: chatd chat

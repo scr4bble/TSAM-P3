@@ -3,11 +3,7 @@
  *
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <termios.h>
-#include <unistd.h>
+#include "getpasswd.h"
 
 /* To read a password without echoing it to the console.
  *
@@ -27,7 +23,7 @@ void getpasswd(const char *prompt, char *passwd, size_t size)
 
         /* Clear out the buffer content. */
         memset(passwd, 0, size);
-        
+
         /* Disable echo. */
 	tcgetattr(fileno(stdin), &old_flags);
 	memcpy(&new_flags, &old_flags, sizeof(old_flags));
@@ -56,3 +52,34 @@ void getpasswd(const char *prompt, char *passwd, size_t size)
 		exit(EXIT_FAILURE);
 	}
 }
+
+
+/*
+void getpasswd(char *passwd, const int size_of_passwd_array)
+{
+	static struct termios oldt, newt;
+	int i = 0;
+	int c;
+
+	printf("Please enter password: ");
+
+	// saving the old settings of STDIN_FILENO and copy settings for resetting
+	tcgetattr( STDIN_FILENO, &oldt);
+	newt = oldt;
+
+	// setting the approriate bit in the termios struct
+	newt.c_lflag &= ~(ECHO);
+
+	// setting the new bits
+	tcsetattr( STDIN_FILENO, TCSANOW, &newt);
+
+	// reading the password from the console
+	while ((c = getchar())!= '\n' && c != EOF && i < size_of_passwd_array){
+		passwd[i++] = c;
+	}
+	passwd[i] = '\0';
+
+	// resetting our old STDIN_FILENO
+	tcsetattr( STDIN_FILENO, TCSANOW, &oldt);
+}
+*/

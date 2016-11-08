@@ -21,6 +21,11 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+#include "getpasswd.h"
+
+
+#define MAX_PASSWD_LENGTH 48
+
 
 /* This variable holds a file descriptor of a pipe on which we send a
  * number if a signal is received. */
@@ -229,10 +234,11 @@ void readline_callback(char *line)
 				return;
 		}
 		char *new_user = strdup(&(line[i]));
-		char passwd[48];
-		getpasswd("Password: ", passwd, 48);
+		char passwd[MAX_PASSWD_LENGTH + 1];
+		getpasswd("Please enter password: ", passwd, sizeof(passwd));
 
 		/* Process and send this information to the server. */
+		printf("Do something with the password <<%s>>\n", passwd);
 
 		/* Maybe update the prompt. */
 		free(prompt);
