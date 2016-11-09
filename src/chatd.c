@@ -483,7 +483,7 @@ bool initialize_openssl()
 	/* Initialize OpenSSL */
 	SSL_library_init();
 	SSL_load_error_strings();
-	ssl_ctx = SSL_CTX_new(TLSv1_client_method());
+	ssl_ctx = SSL_CTX_new(TLSv1_server_method());
 
 	if(!ssl_ctx) {
 		ERR_print_errors_fp(stderr);
