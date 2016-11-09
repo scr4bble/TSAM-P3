@@ -1,4 +1,18 @@
-Update this.
+/*
+ * Programming Assignment 3 – SSL Chat system
+ *
+ * Team:
+ * Einar Örn Gissurarson <einarog05@ru.is>
+ * Óskar Örn <oskart10@ru.is>
+ * Peter Hostačný <peterh16@ru.is>
+ */
+ 
+ The purpose of this project is to create a Chat System, using a Secure Socket Layer protocol.
+ 
+ Protocol Design:
+ 
+ We will be using OpenSSL library for any actual SSL implementation and encryption.
+ The Chat System will use a Client/Server architecture and messages will be passed, using ASCII text format.
 
 
 - generating private key (-aes128 option for key encrypted by passphrase)
