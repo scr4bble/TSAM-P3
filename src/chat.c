@@ -349,7 +349,7 @@ int connect_server(const char *hostname, const int port)
         herror("gethostbyname");
         return -1;
     }
-	struct in_addr *ip_address = host_info->h_addr_list[0];
+	struct in_addr *ip_address = (struct in_addr *) host_info->h_addr_list[0];
 
 	//printf("%s\n", inet_ntoa(*ip_address));
 
@@ -369,6 +369,7 @@ int connect_server(const char *hostname, const int port)
 
 int main(int argc, char **argv)
 {
+	errno = 0; // reset
 	int max_fd = 0;
 
 	if (argc != 3) {
@@ -411,6 +412,7 @@ int main(int argc, char **argv)
 		}
 		else if (error == SSL_ERROR_SYSCALL) {
 			printf("SSL_ERROR_SYSCALL\n");
+			perror("");
 		} else {
 			printf("ret_val_connect: %d\n", ret);
 			printf("error: %d\n", error);

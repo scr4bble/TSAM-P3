@@ -322,17 +322,21 @@ void handle_connection(ClientConnection *connection) {
 			}
 			else if (error == SSL_ERROR_SYSCALL) {
 				printf("SSL_ERROR_SYSCALL\n");
+				perror("");
 			} else {
-				printf("ret_val_accept: %d\n", ret);
-				printf("error: %d\n", error);
+				printf("SSL_connect: %d\n", ret);
+				printf("SSL_get_error: %d\n", error);
+				//printf("ERR_get_error: %lu\n", ERR_get_error());
+
 				remove_ClientConnection(connection);
 				return;
 			}
 		}
+
 	}
 
-	printf("not continuing handling\n");
-	return;
+	//printf("not continuing handling\n");
+	//return;
 
 
 	GString *response = g_string_sized_new(1024);
@@ -551,6 +555,8 @@ bool start_listening(int server_port)
 
 int main(int argc, char **argv)
 {
+	errno = 0; // reset
+
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <port>\n", argv[0]);
 		exit(EXIT_FAILURE);
