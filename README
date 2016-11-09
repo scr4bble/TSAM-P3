@@ -2,14 +2,19 @@ Update this.
 
 
 - generating private key (-aes128 option for key encrypted by passphrase)
-openssl genrsa -out fd.key 2048
+openssl genrsa -out server.key 2048
 
 
 - generating public key from private key:
-openssl rsa -in fd.key -pubout -out fd-public.key
+openssl rsa -in server.key -pubout -out server-public.key
 
 - generating certificate
-openssl req -new -x509 -days 365 -key fd.key -out fd.crt
+openssl req -new -x509 -days 365 -key server.key -out server.crt
 
 - printing info about certificate
-openssl x509 -text -in fd.crt -noout
+openssl x509 -text -in server.crt -noout
+
+- checking if key matches the certificate
+openssl x509 -noout -modulus -in server.crt | openssl md5
+openssl rsa -noout -modulus -in server.key | openssl md5
+

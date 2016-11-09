@@ -30,7 +30,7 @@ run-server:
 	./chatd $(SERVER_PORT)
 
 run-client:
-	./chat localhost $(SERVER_PORT)
+	./chat 127.0.0.1 $(SERVER_PORT)
 
 zip:
 	cd ..; zip chat.zip README src/*.c src/Makefile AUTHORS

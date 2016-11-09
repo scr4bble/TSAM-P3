@@ -4,6 +4,8 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <arpa/inet.h> // inet_addr()
+#include <netdb.h> // gethostbyname()
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,6 +14,9 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <signal.h>
+#include <stdbool.h>
+
+#include <glib.h>
 
 /* Secure socket layer headers */
 #include <openssl/ssl.h>
@@ -24,13 +29,27 @@
 #include "getpasswd.h"
 
 
+// useful macros
+#ifndef max
+	#define max(a,b) (((a) > (b)) ? (a) : (b))
+	#define min(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+
+
 #define MAX_PASSWD_LENGTH 48
+
+#define CA_CERT "../server.crt"
 
 
 /* This variable holds a file descriptor of a pipe on which we send a
  * number if a signal is received. */
-static int exitfd[2]; // [0] = read, [1] = write
+
 static const char CA_LOCATION[] = "";
+
+static int socket_fd;
+static SSL_CTX *ssl_ctx;
+static SSL *ssl;
+static int exitfd[2]; // [0] = read, [1] = write
 
 
 /* If someone kills the client, it should still clean up the readline
@@ -46,6 +65,26 @@ signal_handler(int signum)
 	}
 	fsync(exitfd[1]);
 	errno = _errno;
+}
+
+/* Closes the connection of both socket and file writer, runs destroy_clients_queue function and exits program */
+void clean_and_die(int exit_code) {
+
+	/* Close the connections. */
+	// http://stackoverflow.com/questions/4160347/close-vs-shutdown-socket
+	shutdown(socket_fd, SHUT_RDWR);
+	close(socket_fd);
+
+	SSL_CTX_free(ssl_ctx);
+	SSL_free(ssl);
+	EVP_cleanup();
+
+	close(exitfd[0]);
+	close(exitfd[1]);
+
+	rl_callback_handler_remove();
+
+	exit(exit_code);
 }
 
 
@@ -96,14 +135,32 @@ static void initialize_exitfd(void)
 	}
 }
 
+/* Receive whole packet from socket.
+   Store data into @message (actual content of message will be discarded) */
+bool receive_whole_message(int conn_fd, GString *message) {
 
-/* The next two variables are used to access the encrypted stream to
- * the server. The socket file descriptor server_fd is provided for
- * select (if needed), while the encrypted communication should use
- * server_ssl and the SSL API of OpenSSL.
- */
-static int server_fd;
-static SSL *server_ssl;
+	const ssize_t BUFFER_SIZE = 1024;
+	ssize_t n = 0;
+	char buffer[BUFFER_SIZE];
+	g_string_truncate (message, 0); // empty provided GString variable
+
+	do {
+		n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
+		if (n == -1) { // error while recv()
+			perror("recv error");
+		}
+		else if (n == 0) {
+			printf("Server closed connection.\n");
+			return false;
+		}
+		buffer[n] = '\0';
+		g_string_append_len(message, buffer, n);
+	} while(n > 0 && n == BUFFER_SIZE - 1);
+
+	return true;
+}
+
+
 
 /* This variable shall point to the name of the user. The initial value
    is NULL. Set this variable to the username once the user managed to be
@@ -119,17 +176,6 @@ static char *chatroom;
  * input. It is good style to indicate the name of the user and the
  * chat room he is in as part of the prompt. */
 static char *prompt;
-
-void load_CA_certificate(SSL_CTX *ctx)
-{
-	//SSL_CTX_load_verify_locations(ctx, NULL, const char *CApath);
-
-	// To use the third argument, CApath, specify NULL for CAfile.
-	// You must also hash the CA certificates in the directory specified by CApath.
-	// Use the Certificate Tool (described in Chapter 3) to perform the hashing operation
-
-	return;
-}
 
 
 
@@ -256,33 +302,121 @@ void readline_callback(char *line)
 	fsync(STDOUT_FILENO);
 }
 
-int main(int argc, char **argv)
-{
-	initialize_exitfd();
 
+bool initialize_openssl()
+{
 	/* Initialize OpenSSL */
 	SSL_library_init();
 	SSL_load_error_strings();
-	SSL_CTX *ssl_ctx = SSL_CTX_new(TLSv1_client_method());
+	ssl_ctx = SSL_CTX_new(TLSv1_client_method());
 
-	/* TODO:
-	 * We may want to use a certificate file if we self sign the
-	 * certificates using SSL_use_certificate_file(). If available,
-	 * a private key can be loaded using
-	 * SSL_CTX_use_PrivateKey_file(). The use of private keys with
-	 * a server side key data base can be used to authenticate the
-	 * client.
-	 */
+	if(!ssl_ctx) {
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
 
-	server_ssl = SSL_new(ssl_ctx);
+	if (!SSL_CTX_load_verify_locations(ssl_ctx, CA_CERT, NULL)) {
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
 
-	/* Create and set up a listening socket. The sockets you
-	 * create here can be used in select calls, so do not forget
-	 * them.
-	 */
+	// setting up verification flags
+	// SSL_VERIFY_NONE - no request for a certificate is sent to the client
+	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL); // NULL = built-in default verification function will be used
+	/* Set the verification depth to 1 */
+	SSL_CTX_set_verify_depth(ssl_ctx,1);
+
+
+	ssl = SSL_new(ssl_ctx);
+
+	return true;
+}
+
+// returns socket_fd or -1 in case of error
+int connect_server(const char *hostname, const int port)
+{
+	struct sockaddr_in server;
+
+	/* Create and bind a TCP socket */
+	int sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sockfd == 0) {
+		perror("socket() failed");
+		return -1;
+	}
+
+	const struct hostent* host_info = NULL;
+	if ((host_info = gethostbyname(hostname)) == NULL) {  // get the host info
+        herror("gethostbyname");
+        return -1;
+    }
+	struct in_addr *ip_address = host_info->h_addr_list[0];
+
+	//printf("%s\n", inet_ntoa(*ip_address));
+
+	memset(&server, 0, sizeof(server));
+	server.sin_family = AF_INET;
+	server.sin_addr.s_addr = ip_address->s_addr;
+	server.sin_port = htons(port);
+
+	if (connect(sockfd, (struct sockaddr*) &server, sizeof(server)) != 0) {
+		perror("connect() failed");
+		return -1;
+	}
+
+	return sockfd;
+}
+
+
+int main(int argc, char **argv)
+{
+	int max_fd = 0;
+
+	if (argc != 3) {
+		fprintf(stderr, "Usage: %s <address> <port>\n", argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	const char *ip_address = argv[1];
+	const int server_port = strtol(argv[2], NULL, 10);
+
+	// make pipe for redirecting signals to socket in the set used by select()
+	// catch SIGINT & SIGTERM
+	initialize_exitfd();
+
+	/* Initialize OpenSSL */
+	if (!initialize_openssl()) {
+		return EXIT_FAILURE;
+	}
+
+	// connect to the chat server
+	socket_fd = connect_server(ip_address, server_port);
+	if (socket_fd < 0) {
+		return EXIT_FAILURE;
+	}
 
 	/* Use the socket for the SSL connection. */
-	SSL_set_fd(server_ssl, server_fd);
+	SSL_set_fd(ssl, socket_fd);
+
+	int ret = SSL_connect(ssl);
+	if (ret == 1) {
+		// SSL handshake was successful
+		printf("handshake successful\n");
+	}
+	else {
+		// SSL handshake was not successful, try to figure out what did happen
+		int error = SSL_get_error(ssl, ret);
+		if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+			// operation did not complete the action, should be called again
+			return;
+		}
+		else if (error == SSL_ERROR_SYSCALL) {
+			printf("SSL_ERROR_SYSCALL\n");
+		} else {
+			printf("ret_val_connect: %d\n", ret);
+			printf("error: %d\n", error);
+			return;
+		}
+	}
 
 	/* Now we can create BIOs and use them instead of the socket.
 	 * The BIO is responsible for maintaining the state of the
@@ -307,10 +441,14 @@ int main(int argc, char **argv)
 		FD_ZERO(&rfds);
 		FD_SET(STDIN_FILENO, &rfds);
 		FD_SET(exitfd[0], &rfds);
+		max_fd = max(STDIN_FILENO, exitfd[0]);
+		FD_SET(socket_fd, &rfds);
+		max_fd = max(socket_fd, max_fd);
+
 		timeout.tv_sec = 5;
 		timeout.tv_usec = 0;
 
-		int r = select(exitfd[0] + 1, &rfds, NULL, NULL, &timeout);
+		int r = select(max_fd + 1, &rfds, NULL, NULL, &timeout);
 		if (r < 0) {
 			if (errno == EINTR) {
 				/* This should either retry the call or
@@ -322,7 +460,7 @@ int main(int argc, char **argv)
 			perror("select()");
 			break;
 		}
-		if (r == 0) {
+		if (r == 0) { // timeout
 			write(STDOUT_FILENO, "No message?\n", 12);
 			fsync(STDOUT_FILENO);
 			/* Whenever you print out a message, call this
@@ -343,10 +481,9 @@ int main(int argc, char **argv)
 					}
 				}
 			}
-			if (signum == SIGINT) {
-				/* Don't do anything. */
-			} else if (signum == SIGTERM) {
+			if (signum == SIGINT || signum == SIGTERM) {
 				/* Clean-up and exit. */
+				printf("\nShutting down...\n");
 				break;
 			}
 		}
@@ -354,9 +491,19 @@ int main(int argc, char **argv)
 			rl_callback_read_char();
 		}
 
-	/* Handle messages from the server here! */
+		/* Handle messages from the server here! */
+		GString *received_message = g_string_sized_new(1024);
+		if (!receive_whole_message(socket_fd, received_message)) {
+			// message was not received or has length 0
+			break;
+		}
+		else {
+			printf("Received:\n%s\n", received_message->str);
+		}
+		g_string_free(received_message, TRUE);
 	}
 
 	/* replace by code to shutdown the connection and exit
 	   the program. */
+	clean_and_die(0);
 }

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE // we need accept4() from <sys/socket.h>
+
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -9,6 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <fcntl.h> // O_NONBLOCK flag
 
 #include <glib.h>
 
@@ -17,6 +20,12 @@
 #include <openssl/err.h>
 
 
+/* USEFUL WEBPAGES:
+ * http://etutorials.org/Programming/secure+programming/Chapter+10.+Public+Key+Infrastructure/10.7+Verifying+an+SSL+Peer+s+Certificate/
+ * // how to prevent DoS like behavior/attack.
+ * http://stackoverflow.com/questions/1744523/ssl-accept-with-blocking-socket
+ *
+ */
 
 // useful macros
 #ifndef max
@@ -27,21 +36,51 @@
 // default keep-alive timeout for clients
 #define KEEP_ALIVE_TIMEOUT 30
 
+
+#define SERVER_CERT_FILE "../server.crt"
+#define SERVER_KEY_FILE "../server.key"
+
+
 // welcome message
 static const char WELCOME_MSG[] = "Welcome";
 
+static SSL_CTX *ssl_ctx; // encryption for sockets
 static int sockfd; // master socket (server listening socket)
 static GQueue *clients_queue;
 //static GHashTable* cookies;
 
 
 typedef struct ClientConnection {
+	SSL *ssl;
+	bool ssl_handshake_done;
 	int conn_fd;
 	GTimer *conn_timer;
-	int request_count;
 	struct sockaddr_in client_sockaddr;
 	GString *cookie_token;
 } ClientConnection;
+
+
+/* When a new client wishes to establish a connection, we create the connection and add it to the queue */
+ClientConnection* new_ClientConnection(int conn_fd) {
+	ClientConnection *connection = g_new0(ClientConnection, 1);
+	// find out client IP and port
+	int addrlen = sizeof(connection->client_sockaddr);
+	getpeername(conn_fd, (struct sockaddr*)&(connection->client_sockaddr), (socklen_t*)&addrlen);
+
+	connection->conn_fd = conn_fd;
+	connection->conn_timer = g_timer_new();
+	connection->cookie_token = g_string_new(NULL);
+
+	connection->ssl_handshake_done = false;
+	connection->ssl = SSL_new(ssl_ctx);
+
+	/* Use encryption during connection. */
+	SSL_set_fd(connection->ssl, conn_fd);
+
+	g_queue_push_tail(clients_queue, connection);
+
+	return connection;
+}
 
 
 /* Destroy/close/free instance of ClientConnection.
@@ -50,7 +89,7 @@ void destroy_ClientConnection(ClientConnection *connection) {
 
 	printf("Closing connection %s:%d (fd:%d)\n", inet_ntoa(connection->client_sockaddr.sin_addr),
 			ntohs(connection->client_sockaddr.sin_port), connection->conn_fd);
-
+	SSL_free(connection->ssl);
 	close(connection->conn_fd); // close socket with client connection
 	g_timer_destroy(connection->conn_timer); // destroy timer
 	g_string_free(connection->cookie_token, TRUE);
@@ -80,6 +119,8 @@ void clean_and_die(int exit_code) {
 	// http://stackoverflow.com/questions/4160347/close-vs-shutdown-socket
 	shutdown(sockfd, SHUT_RDWR);
 	close(sockfd);
+	SSL_CTX_free(ssl_ctx);
+	EVP_cleanup();
 
 	//fclose(log_file);
 
@@ -127,20 +168,6 @@ void log_msg(Request *request) {
 */
 
 
-
-/* When a new client wishes to establish a connection, we create the connection and add it to the queue */
-void new_client(int conn_fd) {
-	ClientConnection *connection = g_new0(ClientConnection, 1);
-	// find out client IP and port
-	int addrlen = sizeof(connection->client_sockaddr);
-	getpeername(conn_fd, (struct sockaddr*)&(connection->client_sockaddr), (socklen_t*)&addrlen);
-
-	connection->conn_fd = conn_fd;
-	connection->request_count = 0;
-	connection->conn_timer = g_timer_new();
-	connection->cookie_token = g_string_new(NULL);
-	g_queue_push_tail(clients_queue, connection);
-}
 
 /* Add child socket to set */
 void add_socket_into_set(ClientConnection *connection, fd_set *readfds_ptr) {
@@ -259,9 +286,53 @@ void parse_received_msg(GString *received_message) {
 }
 
 
+void try_perform_ssl_handshake (ClientConnection *connection) {
+
+	int flags = fcntl(connection->conn_fd, F_GETFL, 0);
+	if (flags < 0) {
+		printf("fcntl: F_GETFL \n");
+		return;
+	}
+	if (fcntl(connection->conn_fd, F_SETFL, flags & (~O_NONBLOCK)) < 0) {
+		printf("fcntl: F_SETFL \n");
+		return;
+	}
+
+}
+
+
 /* Processes the request of client and builds a response,
    using recieve_whole_message, parse_request, create_html_page and log_msg */
 void handle_connection(ClientConnection *connection) {
+
+	if (!connection->ssl_handshake_done) {
+
+		int ret = SSL_accept(connection->ssl);
+		if (ret == 1) {
+			// SSL handshake was successful
+			connection->ssl_handshake_done = true;
+			printf("handshake done\n");
+		}
+		else {
+			// SSL handshake was not successful, try to figure out what did happen
+			int error = SSL_get_error(connection->ssl, ret);
+			if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+				// operation did not complete the action, should be called again
+				return;
+			}
+			else if (error == SSL_ERROR_SYSCALL) {
+				printf("SSL_ERROR_SYSCALL\n");
+			} else {
+				printf("ret_val_accept: %d\n", ret);
+				printf("error: %d\n", error);
+				remove_ClientConnection(connection);
+				return;
+			}
+		}
+	}
+
+	printf("not continuing handling\n");
+	return;
 
 
 	GString *response = g_string_sized_new(1024);
@@ -275,11 +346,15 @@ void handle_connection(ClientConnection *connection) {
 	GString *received_message = g_string_sized_new(1024);
 	if (!receive_whole_message(connection->conn_fd, received_message)) {
 		// message was not received or has length 0
+		remove_ClientConnection(connection);
+		return;
 	}
-	fprintf(stdout, "Received:\n%s\n", received_message->str);
+	printf("Received:\n%s\n", received_message->str);
 
 	// parse request
 	parse_received_msg(received_message);
+
+	g_string_append(response, "Encrypted greetings from server :)");
 
 	send(connection->conn_fd, response->str, response->len, 0);
 
@@ -340,16 +415,20 @@ void run_loop() {
 		if (FD_ISSET(sockfd, &readfds)) {
 			//If something happened on the master socket , then its an incoming connection
 			socklen_t len = (socklen_t) sizeof(client);
-			// accept new client
+			// accept new client & set the O_NONBLOCK file status flag on the created socket
 			int conn_fd = accept(sockfd, (struct sockaddr *) &client, &len);
+			if (conn_fd < 0) {
+				perror("Unable to accept()");
+				return;
+			}
 
 			//add new client into the queue
-			new_client(conn_fd);
+			ClientConnection *new_client = new_ClientConnection(conn_fd);
 
 			printf("New connection: %s:%d (socket: %d )\n",
 					inet_ntoa(client.sin_addr), ntohs(client.sin_port), conn_fd);
 
-			handle_connection(g_queue_peek_tail(clients_queue));
+			handle_connection(new_client);
 		}
 
 		g_queue_foreach(clients_queue, (GFunc) handle_socket_if_waiting, &readfds);
@@ -373,7 +452,7 @@ int sockaddr_in_cmp(const void *addr1, const void *addr2)
 	/* If either of the pointers is NULL or the addresses
 	   belong to different families, we abort. */
 	g_assert((_addr1 == NULL) || (_addr2 == NULL) ||
-		    (_addr1->sin_family != _addr2->sin_family));
+			(_addr1->sin_family != _addr2->sin_family));
 
 	if (_addr1->sin_addr.s_addr < _addr2->sin_addr.s_addr) {
 		return -1;
@@ -395,6 +474,42 @@ gint fd_cmp(gconstpointer fd1,  gconstpointer fd2, gpointer G_GNUC_UNUSED data)
 	return GPOINTER_TO_INT(fd1) - GPOINTER_TO_INT(fd2);
 }
 
+bool initialize_openssl()
+{
+	/* Initialize OpenSSL */
+	SSL_library_init();
+	SSL_load_error_strings();
+	ssl_ctx = SSL_CTX_new(TLSv1_client_method());
+
+	if(!ssl_ctx) {
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
+
+	/* Load server certificate into the SSL context */
+	if (SSL_CTX_use_certificate_file(ssl_ctx, SERVER_CERT_FILE, SSL_FILETYPE_PEM) <= 0) {
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
+
+	/* Load the server private-key into the SSL context */
+	if (SSL_CTX_use_PrivateKey_file(ssl_ctx, SERVER_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
+
+	if (SSL_CTX_check_private_key(ssl_ctx) != 1) {
+		fprintf(stderr, "Private key doesn't match the certificate.\n");
+		return false;
+	}
+
+	// setting up verification flags
+	// SSL_VERIFY_NONE - no request for a certificate is sent to the client
+	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL); // NULL = built-in default verification function will be used
+
+	return true;
+}
+
 
 bool start_listening(int server_port)
 {
@@ -407,8 +522,10 @@ bool start_listening(int server_port)
 		return false;
 	}
 
+	// setting up flag SO_REUSEADDR for server socket
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)) < 0)
 		perror("setsockopt(SO_REUSEADDR) failed");
+
 
 	/* Network functions need arguments in network byte order instead of
 	   host byte order. The macros htonl, htons convert the values. */
@@ -448,23 +565,17 @@ int main(int argc, char **argv)
 	// create queue for storing client connections
 	clients_queue = g_queue_new();
 
+	// OPENSSL initialization
+	if (!initialize_openssl()) {
+		clean_and_die(EXIT_FAILURE);
+	}
+
 	// create socket and start listening
 	if (!start_listening(server_port)) {
-		clean_and_die(1);
+		clean_and_die(EXIT_FAILURE);
 	}
 
 	run_loop();
 
 	clean_and_die(0);
-
-	/* Initialize OpenSSL */
-	SSL_library_init();
-	SSL_load_error_strings();
-	SSL_CTX *ssl_ctx = SSL_CTX_new(TLSv1_client_method());
-
-
-
-	/* Receive and handle messages. */
-
-	exit(EXIT_SUCCESS);
 }
