@@ -40,7 +40,6 @@
 
 #define CA_CERT "../server.crt"
 
-
 /* This variable holds a file descriptor of a pipe on which we send a
  * number if a signal is received. */
 
@@ -135,27 +134,33 @@ static void initialize_exitfd(void)
 	}
 }
 
+
 /* Receive whole packet from socket.
    Store data into @message (actual content of message will be discarded) */
-bool receive_whole_message(int conn_fd, GString *message) {
+bool receive_whole_message(SSL *ssl, GString *message) {
 
 	const ssize_t BUFFER_SIZE = 1024;
 	ssize_t n = 0;
 	char buffer[BUFFER_SIZE];
 	g_string_truncate (message, 0); // empty provided GString variable
 
-	do {
-		n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
-		if (n == -1) { // error while recv()
-			perror("recv error");
-		}
-		else if (n == 0) {
-			printf("Server closed connection.\n");
+	//n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
+	n = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
+	int error = SSL_get_error(ssl, n);
+
+	switch (error) {
+		case SSL_ERROR_NONE:
+			buffer[n] = '\0'; // just in case, not needed
+			g_string_append_len(message, buffer, n);
+			break;
+		case SSL_ERROR_WANT_READ:
+		case SSL_ERROR_WANT_WRITE:
+			return true;
+		default:
+			// perror("SSL_read error");
+			// server closed connection ?????
 			return false;
-		}
-		buffer[n] = '\0';
-		g_string_append_len(message, buffer, n);
-	} while(n > 0 && n == BUFFER_SIZE - 1);
+	}
 
 	return true;
 }
@@ -398,26 +403,14 @@ int main(int argc, char **argv)
 	/* Use the socket for the SSL connection. */
 	SSL_set_fd(ssl, socket_fd);
 
+	ERR_clear_error();
 	int ret = SSL_connect(ssl);
 	if (ret == 1) {
 		// SSL handshake was successful
-		printf("handshake successful\n");
-	}
-	else {
-		// SSL handshake was not successful, try to figure out what did happen
-		int error = SSL_get_error(ssl, ret);
-		if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-			// operation did not complete the action, should be called again
-			return;
-		}
-		else if (error == SSL_ERROR_SYSCALL) {
-			printf("SSL_ERROR_SYSCALL\n");
-			perror("");
-		} else {
-			printf("ret_val_connect: %d\n", ret);
-			printf("error: %d\n", error);
-			return;
-		}
+		printf("SSL handshake done\n");
+	} else {
+		fprintf(stderr, "SSL handshake failed\n");
+		clean_and_die(EXIT_FAILURE);
 	}
 
 	/* Now we can create BIOs and use them instead of the socket.
@@ -493,16 +486,20 @@ int main(int argc, char **argv)
 			rl_callback_read_char();
 		}
 
-		/* Handle messages from the server here! */
-		GString *received_message = g_string_sized_new(1024);
-		if (!receive_whole_message(socket_fd, received_message)) {
-			// message was not received or has length 0
-			break;
+		if (FD_ISSET(socket_fd, &rfds)) {
+			/* Handle messages from the server here! */
+			GString *received_message = g_string_sized_new(1024);
+			if (!receive_whole_message(ssl, received_message)) {
+				// message was not received or has length 0
+				break;
+			}
+			else {
+				printf("%s\n", received_message->str);
+			}
+			g_string_free(received_message, TRUE);
 		}
-		else {
-			printf("Received:\n%s\n", received_message->str);
-		}
-		g_string_free(received_message, TRUE);
+
+
 	}
 
 	/* replace by code to shutdown the connection and exit

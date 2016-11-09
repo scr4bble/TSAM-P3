@@ -50,6 +50,8 @@ static GQueue *clients_queue;
 //static GHashTable* cookies;
 
 
+
+
 typedef struct ClientConnection {
 	SSL *ssl;
 	bool ssl_handshake_done;
@@ -58,6 +60,19 @@ typedef struct ClientConnection {
 	struct sockaddr_in client_sockaddr;
 	GString *cookie_token;
 } ClientConnection;
+
+
+/* Function for printing log messages to output. */
+void log_msg(ClientConnection *connection, char *message) {
+
+	time_t now = time(NULL);
+	struct tm *now_tm = gmtime(&now);
+	char iso_8601[] = "YYYY-MM-DDThh:mm:ssTZD";
+	strftime(iso_8601, sizeof iso_8601, "%FT%T%Z", now_tm);
+
+	printf("%s : %s:%d %s\n", iso_8601, inet_ntoa(connection->client_sockaddr.sin_addr),
+			ntohs(connection->client_sockaddr.sin_port), message);
+}
 
 
 /* When a new client wishes to establish a connection, we create the connection and add it to the queue */
@@ -87,8 +102,8 @@ ClientConnection* new_ClientConnection(int conn_fd) {
    @connection has to be allocated by malloc() */
 void destroy_ClientConnection(ClientConnection *connection) {
 
-	printf("Closing connection %s:%d (fd:%d)\n", inet_ntoa(connection->client_sockaddr.sin_addr),
-			ntohs(connection->client_sockaddr.sin_port), connection->conn_fd);
+	log_msg(connection, "disconnected");
+
 	SSL_free(connection->ssl);
 	close(connection->conn_fd); // close socket with client connection
 	g_timer_destroy(connection->conn_timer); // destroy timer
@@ -145,29 +160,6 @@ void sig_handler(int signal_n) {
 
 
 
-// TODO - need to be modified according to assignment !!!!!
-/* Function for printing log messages to output. */
-/*
-void log_msg(Request *request) {
-
-	time_t now = time(NULL);
-	struct tm *now_tm = gmtime(&now);
-	char iso_8601[] = "YYYY-MM-DDThh:mm:ssTZD";
-	strftime(iso_8601, sizeof iso_8601, "%FT%T%Z", now_tm);
-
-
-	GString *log_msg = g_string_new(iso_8601);
-	g_string_append_printf(log_msg, " : %s %s %s : InsertResponseCodeHere \n", request->host->str, http_methods[request->method], request->path->str);
-
-	fprintf(log_file, "%s", log_msg->str); // print log message to log file
-	fflush(log_file);
-	g_string_free(log_msg, TRUE); // free memory
-
-	return;
-}
-*/
-
-
 
 /* Add child socket to set */
 void add_socket_into_set(ClientConnection *connection, fd_set *readfds_ptr) {
@@ -206,25 +198,29 @@ void check_timer(ClientConnection *connection) {
 
 /* Receive whole packet from socket.
    Store data into @message (actual content of message will be discarded) */
-bool receive_whole_message(int conn_fd, GString *message) {
+bool receive_whole_message(ClientConnection *connection, GString *message) {
 
 	const ssize_t BUFFER_SIZE = 1024;
 	ssize_t n = 0;
 	char buffer[BUFFER_SIZE];
 	g_string_truncate (message, 0); // empty provided GString variable
 
-	do {
-		n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
-		if (n == -1) { // error while recv()
-			perror("recv error");
-		}
-		else if (n == 0) {
-			printf("Client was disconnected.\n");
+	//n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
+	n = SSL_read(connection->ssl, buffer, BUFFER_SIZE - 1);
+	int error = SSL_get_error(connection->ssl, n);
+
+	switch (error) {
+		case SSL_ERROR_NONE:
+			buffer[n] = '\0'; // just in case, not needed
+			g_string_append_len(message, buffer, n);
+			break;
+		case SSL_ERROR_WANT_READ:
+		case SSL_ERROR_WANT_WRITE:
+			return true;
+		default:
+			//perror("SSL_read error");
 			return false;
-		}
-		buffer[n] = '\0';
-		g_string_append_len(message, buffer, n);
-	} while(n > 0 && n == BUFFER_SIZE - 1);
+	}
 
 	return true;
 }
@@ -288,6 +284,35 @@ void parse_received_msg(GString *received_message) {
 
 void try_perform_ssl_handshake (ClientConnection *connection) {
 
+	ERR_clear_error();
+	int ret = SSL_accept(connection->ssl);
+	if (ret == 1) {
+		// SSL handshake was successful
+		connection->ssl_handshake_done = true;
+		log_msg(connection, "connected");
+		return;
+	}
+	else {
+		// SSL handshake was not successful, try to figure out what did happen
+		int error = SSL_get_error(connection->ssl, ret);
+		if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+			// operation did not complete the action, should be called again
+			return;
+		} else {
+			log_msg(connection, "SSL handshake failed");
+			char buf[120];
+			ERR_error_string_n(error, buf, sizeof(buf));
+			//printf("SSL_connect() return value: %d\n", ret);
+			//printf("SSL_get_error(): %d\n", error);
+			//printf("ERR_error_string_n(): %s\n", buf);
+
+			remove_ClientConnection(connection);
+			return;
+		}
+	}
+
+
+/*
 	int flags = fcntl(connection->conn_fd, F_GETFL, 0);
 	if (flags < 0) {
 		printf("fcntl: F_GETFL \n");
@@ -297,7 +322,7 @@ void try_perform_ssl_handshake (ClientConnection *connection) {
 		printf("fcntl: F_SETFL \n");
 		return;
 	}
-
+*/
 }
 
 
@@ -305,61 +330,30 @@ void try_perform_ssl_handshake (ClientConnection *connection) {
    using recieve_whole_message, parse_request, create_html_page and log_msg */
 void handle_connection(ClientConnection *connection) {
 
+	// if SSL handshake was not performed yet
 	if (!connection->ssl_handshake_done) {
-
-		int ret = SSL_accept(connection->ssl);
-		if (ret == 1) {
-			// SSL handshake was successful
-			connection->ssl_handshake_done = true;
-			printf("handshake done\n");
-		}
-		else {
-			// SSL handshake was not successful, try to figure out what did happen
-			int error = SSL_get_error(connection->ssl, ret);
-			if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-				// operation did not complete the action, should be called again
-				return;
-			}
-			else if (error == SSL_ERROR_SYSCALL) {
-				printf("SSL_ERROR_SYSCALL\n");
-				perror("");
-			} else {
-				printf("SSL_connect: %d\n", ret);
-				printf("SSL_get_error: %d\n", error);
-				//printf("ERR_get_error: %lu\n", ERR_get_error());
-
-				remove_ClientConnection(connection);
-				return;
-			}
-		}
-
+		try_perform_ssl_handshake(connection);
+		return;
 	}
-
-	//printf("not continuing handling\n");
-	//return;
-
 
 	GString *response = g_string_sized_new(1024);
 
-
-	// print out client IP and port
-	printf("Serving client %s:%d (fd:%d)\n", inet_ntoa(connection->client_sockaddr.sin_addr),
-			ntohs(connection->client_sockaddr.sin_port), connection->conn_fd);
-
 	// Receiving packet from socket
 	GString *received_message = g_string_sized_new(1024);
-	if (!receive_whole_message(connection->conn_fd, received_message)) {
+	if (!receive_whole_message(connection, received_message)) {
 		// message was not received or has length 0
 		remove_ClientConnection(connection);
 		return;
 	}
-	printf("Received:\n%s\n", received_message->str);
+	//printf("Received:\n%s\n", received_message->str);
 
-	// parse request
+	// parse message from client
 	parse_received_msg(received_message);
 
 	g_string_append(response, "Encrypted greetings from server :)");
 
+
+	ERR_clear_error();
 	send(connection->conn_fd, response->str, response->len, 0);
 
 	g_string_free(received_message, TRUE);
@@ -420,7 +414,7 @@ void run_loop() {
 			//If something happened on the master socket , then its an incoming connection
 			socklen_t len = (socklen_t) sizeof(client);
 			// accept new client & set the O_NONBLOCK file status flag on the created socket
-			int conn_fd = accept(sockfd, (struct sockaddr *) &client, &len);
+			int conn_fd = accept4(sockfd, (struct sockaddr *) &client, &len, O_NONBLOCK);
 			if (conn_fd < 0) {
 				perror("Unable to accept()");
 				return;
@@ -429,8 +423,7 @@ void run_loop() {
 			//add new client into the queue
 			ClientConnection *new_client = new_ClientConnection(conn_fd);
 
-			printf("New connection: %s:%d (socket: %d )\n",
-					inet_ntoa(client.sin_addr), ntohs(client.sin_port), conn_fd);
+			log_msg(new_client, "New connection");
 
 			handle_connection(new_client);
 		}
