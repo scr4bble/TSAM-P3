@@ -1,7 +1,6 @@
-#SSL Chat System
+# Programming Assignment 3 
+– SSL Chat system
 /*
- * Programming Assignment 3 – SSL Chat system
- *
  * Team:
  * Einar Örn Gissurarson <einarog05@ru.is>
  * Óskar Örn <oskart10@ru.is>
@@ -13,7 +12,7 @@
  Protocol Design:
  
  We will be using OpenSSL library for any actual SSL implementation and encryption.
- The Chat System will use a Client/Server architecture and messages will be passed, using ASCII text format.
+ The Chat System will use a Client/Server architecture. Messages will be passed, using ASCII text format, where the maximum size of messages is 1000 bytes.
 
  6.2. Answers:
  The passwords are stored on the server side, in a hashed form.
@@ -21,6 +20,7 @@
  Clients will send their password over to the server in a plain text format, because the transmission will be encrytped, 
  thus nobody can read the password in transit.
 
+ 
 - generating private key (-aes128 option for key encrypted by passphrase)
 openssl genrsa -out server.key 2048
 
