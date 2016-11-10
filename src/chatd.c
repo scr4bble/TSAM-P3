@@ -10,14 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <stdbool.h>
 #include <fcntl.h> // O_NONBLOCK flag
 
-#include <glib.h>
-
-/* Secure socket layer headers */
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include "chat_common.h"
 
 
 /* USEFUL WEBPAGES:
@@ -47,6 +42,7 @@ static const char WELCOME_MSG[] = "Welcome";
 static SSL_CTX *ssl_ctx; // encryption for sockets
 static int sockfd; // master socket (server listening socket)
 static GQueue *clients_queue;
+static GQueue *clients_write_queue;
 //static GHashTable* cookies;
 
 
@@ -58,6 +54,7 @@ typedef struct ClientConnection {
 	int conn_fd;
 	GTimer *conn_timer;
 	struct sockaddr_in client_sockaddr;
+	GString *write_buffer;
 	GString *cookie_token;
 } ClientConnection;
 
@@ -85,9 +82,11 @@ ClientConnection* new_ClientConnection(int conn_fd) {
 	connection->conn_fd = conn_fd;
 	connection->conn_timer = g_timer_new();
 	connection->cookie_token = g_string_new(NULL);
+	connection->write_buffer = g_string_new(NULL);
 
 	connection->ssl_handshake_done = false;
 	connection->ssl = SSL_new(ssl_ctx);
+	SSL_set_accept_state(connection->ssl);
 
 	/* Use encryption during connection. */
 	SSL_set_fd(connection->ssl, conn_fd);
@@ -108,6 +107,7 @@ void destroy_ClientConnection(ClientConnection *connection) {
 	close(connection->conn_fd); // close socket with client connection
 	g_timer_destroy(connection->conn_timer); // destroy timer
 	g_string_free(connection->cookie_token, TRUE);
+	g_string_free(connection->write_buffer, TRUE);
 	g_free(connection); // free memory allocated for this instance of ClientConnection
 }
 
@@ -144,6 +144,8 @@ void clean_and_die(int exit_code) {
 	destroy_clients_queue(clients_queue);
 	clients_queue = NULL;
 
+	g_queue_free(clients_write_queue);
+
 	//g_hash_table_destroy(cookies);
 
 	exit(exit_code);
@@ -158,6 +160,35 @@ void sig_handler(int signal_n) {
 	clean_and_die(0);
 }
 
+
+/* Encrypt message and try to send it through ssl connection.
+ */
+bool write_message(ClientConnection *connection, char *message) {
+
+	ERR_clear_error();
+	ssize_t n = SSL_write(connection->ssl, message, strlen(message));
+	int error = SSL_get_error(connection->ssl, n);
+
+	switch (error) {
+		case SSL_ERROR_NONE:
+			if (n == strlen(message)) {
+				//printf("whole message sent successfully\n");
+				g_queue_remove(clients_write_queue, connection);
+				g_string_truncate(connection->write_buffer, 0);
+				return true;
+			}
+		case SSL_ERROR_WANT_READ:
+		case SSL_ERROR_WANT_WRITE:
+			if (!g_queue_find(clients_write_queue, connection))
+				g_queue_push_tail(clients_write_queue, connection);
+			g_string_assign(connection->write_buffer, message);
+			return true;
+		default:
+			// perror("SSL_write error");
+			// probably closed connection
+			return false;
+	}
+}
 
 
 
@@ -179,50 +210,18 @@ int return_max_sockfd_in_queue(GQueue *clients_queue) {
 }
 
 
-// TODO - need to be modified according to assignment !!!
+
 /* Check timer of the connection and close/destroy connection if time exceeded KEEP_ALIVE_TIMEOUT seconds */
-/*
 void check_timer(ClientConnection *connection) {
 
 	gdouble seconds_elapsed = g_timer_elapsed(connection->conn_timer, NULL);
-
-	if (seconds_elapsed >= KEEP_ALIVE_TIMEOUT) {
-		printf("[TIMEOUT] ");
+	if (seconds_elapsed >= MAX_IDLE_TIME) {
+		log_msg(connection, "timed out.");
 		destroy_ClientConnection(connection);
 		if (!g_queue_remove(clients_queue, connection)) {
 			printf("Something is wrong. Connection was not found in queue.\n");
 		}
 	}
-}*/
-
-
-/* Receive whole packet from socket.
-   Store data into @message (actual content of message will be discarded) */
-bool receive_whole_message(ClientConnection *connection, GString *message) {
-
-	const ssize_t BUFFER_SIZE = 1024;
-	ssize_t n = 0;
-	char buffer[BUFFER_SIZE];
-	g_string_truncate (message, 0); // empty provided GString variable
-
-	//n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
-	n = SSL_read(connection->ssl, buffer, BUFFER_SIZE - 1);
-	int error = SSL_get_error(connection->ssl, n);
-
-	switch (error) {
-		case SSL_ERROR_NONE:
-			buffer[n] = '\0'; // just in case, not needed
-			g_string_append_len(message, buffer, n);
-			break;
-		case SSL_ERROR_WANT_READ:
-		case SSL_ERROR_WANT_WRITE:
-			return true;
-		default:
-			//perror("SSL_read error");
-			return false;
-	}
-
-	return true;
 }
 
 
@@ -282,7 +281,7 @@ void parse_received_msg(GString *received_message) {
 }
 
 
-void try_perform_ssl_handshake (ClientConnection *connection) {
+bool try_perform_ssl_handshake (ClientConnection *connection) {
 
 	ERR_clear_error();
 	int ret = SSL_accept(connection->ssl);
@@ -290,14 +289,14 @@ void try_perform_ssl_handshake (ClientConnection *connection) {
 		// SSL handshake was successful
 		connection->ssl_handshake_done = true;
 		log_msg(connection, "connected");
-		return;
+		return true;
 	}
 	else {
 		// SSL handshake was not successful, try to figure out what did happen
 		int error = SSL_get_error(connection->ssl, ret);
 		if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
 			// operation did not complete the action, should be called again
-			return;
+			return false;
 		} else {
 			log_msg(connection, "SSL handshake failed");
 			char buf[120];
@@ -307,22 +306,9 @@ void try_perform_ssl_handshake (ClientConnection *connection) {
 			//printf("ERR_error_string_n(): %s\n", buf);
 
 			remove_ClientConnection(connection);
-			return;
+			return false;
 		}
 	}
-
-
-/*
-	int flags = fcntl(connection->conn_fd, F_GETFL, 0);
-	if (flags < 0) {
-		printf("fcntl: F_GETFL \n");
-		return;
-	}
-	if (fcntl(connection->conn_fd, F_SETFL, flags & (~O_NONBLOCK)) < 0) {
-		printf("fcntl: F_SETFL \n");
-		return;
-	}
-*/
 }
 
 
@@ -330,17 +316,21 @@ void try_perform_ssl_handshake (ClientConnection *connection) {
    using recieve_whole_message, parse_request, create_html_page and log_msg */
 void handle_connection(ClientConnection *connection) {
 
+	g_timer_start(connection->conn_timer); // reset timer
+
 	// if SSL handshake was not performed yet
 	if (!connection->ssl_handshake_done) {
-		try_perform_ssl_handshake(connection);
+		if (try_perform_ssl_handshake(connection)) {
+			write_message(connection, "Welcome");
+		}
 		return;
 	}
 
-	GString *response = g_string_sized_new(1024);
+	GString *response = g_string_sized_new(MAX_PACKET_SIZE);
 
 	// Receiving packet from socket
-	GString *received_message = g_string_sized_new(1024);
-	if (!receive_whole_message(connection, received_message)) {
+	GString *received_message = g_string_sized_new(MAX_PACKET_SIZE);
+	if (!read_message(connection->ssl, received_message)) {
 		// message was not received or has length 0
 		remove_ClientConnection(connection);
 		return;
@@ -352,9 +342,7 @@ void handle_connection(ClientConnection *connection) {
 
 	g_string_append(response, "Encrypted greetings from server :)");
 
-
-	ERR_clear_error();
-	send(connection->conn_fd, response->str, response->len, 0);
+	write_message(connection, response->str);
 
 	g_string_free(received_message, TRUE);
 	g_string_free(response, TRUE);
@@ -373,6 +361,16 @@ void handle_socket_if_waiting(ClientConnection *connection, fd_set *readfds) {
 	}
 }
 
+
+/* check if there is a socket ready for writing and send write_buffer to client */
+void send_message_if_ready(ClientConnection *connection, fd_set *writefds) {
+
+	if (FD_ISSET(connection->conn_fd, writefds)) {
+		write_message(connection, connection->write_buffer->str);
+	}
+}
+
+
 /* A looping function that waits for incoming connection, adds it
    to the queue and attempts to processes all clients waiting in the queue */
 void run_loop() {
@@ -382,31 +380,34 @@ void run_loop() {
 	//cookies = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
 	fd_set readfds;
+	fd_set writefds;
 	while(42) {
 		struct timeval tv;
 		// every second check all timers - for purposes of handling keep-alive timeout
 		tv.tv_sec = 1;
 		tv.tv_usec = 0;
 
-		//clear the socket set
+		//clear the socket sets
 		FD_ZERO(&readfds);
+		FD_ZERO(&writefds);
 
 		//add master socket to set
 		FD_SET(sockfd, &readfds);
 		max_sockfd = max(sockfd, return_max_sockfd_in_queue(clients_queue));
+		max_sockfd = max(max_sockfd, return_max_sockfd_in_queue(clients_write_queue));
 
-		//add child sockets to set
+		//add child sockets to sets
 		g_queue_foreach(clients_queue, (GFunc) add_socket_into_set, &readfds);
+		g_queue_foreach(clients_write_queue, (GFunc) add_socket_into_set, &writefds);
 
-		int retval = select(max_sockfd + 1, &readfds, NULL, NULL, &tv);
+		int retval = select(max_sockfd + 1, &readfds, &writefds, NULL, &tv);
 		if (retval < 0) {
 			perror("select error");
 			return;
 
 		}
 		else if (retval == 0) { // timeout
-			// TODO: timeouts !!!
-			//g_queue_foreach(clients_queue, (GFunc) check_timer, NULL);
+			g_queue_foreach(clients_queue, (GFunc) check_timer, NULL);
 			continue;
 		}
 
@@ -430,9 +431,10 @@ void run_loop() {
 
 		g_queue_foreach(clients_queue, (GFunc) handle_socket_if_waiting, &readfds);
 
-		// TODO - timers
+		g_queue_foreach(clients_write_queue, (GFunc) send_message_if_ready, &writefds);
+
 		// check timer of every connection in queue
-		//g_queue_foreach(clients_queue, (GFunc) check_timer, NULL);
+		g_queue_foreach(clients_queue, (GFunc) check_timer, NULL);
 
 	}
 }
@@ -563,6 +565,7 @@ int main(int argc, char **argv)
 
 	// create queue for storing client connections
 	clients_queue = g_queue_new();
+	clients_write_queue = g_queue_new();
 
 	// OPENSSL initialization
 	if (!initialize_openssl()) {

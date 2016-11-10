@@ -14,20 +14,13 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <signal.h>
-#include <stdbool.h>
-
-#include <glib.h>
-
-/* Secure socket layer headers */
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 
 /* For nicer interaction, we use the GNU readline library. */
 #include <readline/readline.h>
 #include <readline/history.h>
 
 #include "getpasswd.h"
-
+#include "chat_common.h"
 
 // useful macros
 #ifndef max
@@ -132,37 +125,6 @@ static void initialize_exitfd(void)
 		perror("sigaction");
 		exit(EXIT_FAILURE);
 	}
-}
-
-
-/* Receive whole packet from socket.
-   Store data into @message (actual content of message will be discarded) */
-bool receive_whole_message(SSL *ssl, GString *message) {
-
-	const ssize_t BUFFER_SIZE = 1024;
-	ssize_t n = 0;
-	char buffer[BUFFER_SIZE];
-	g_string_truncate (message, 0); // empty provided GString variable
-
-	//n = recv(conn_fd, buffer, BUFFER_SIZE - 1, 0);
-	n = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
-	int error = SSL_get_error(ssl, n);
-
-	switch (error) {
-		case SSL_ERROR_NONE:
-			buffer[n] = '\0'; // just in case, not needed
-			g_string_append_len(message, buffer, n);
-			break;
-		case SSL_ERROR_WANT_READ:
-		case SSL_ERROR_WANT_WRITE:
-			return true;
-		default:
-			// perror("SSL_read error");
-			// server closed connection ?????
-			return false;
-	}
-
-	return true;
 }
 
 
@@ -307,6 +269,28 @@ void readline_callback(char *line)
 	fsync(STDOUT_FILENO);
 }
 
+/* return false if server closed connection */
+bool process_server_message()
+{
+	GString *received_message = g_string_sized_new(1024);
+	if (!read_message(ssl, received_message)) {
+		// connection was probably closed
+		return false;
+	}
+
+
+
+	// PROCESS PACKET (MESSAGE) from server HERE
+	printf("%s\n", received_message->str);
+	// PROCESS PACKET (MESSAGE) from server HERE
+
+
+
+
+	g_string_free(received_message, TRUE);
+	return true;
+}
+
 
 bool initialize_openssl()
 {
@@ -331,8 +315,11 @@ bool initialize_openssl()
 	/* Set the verification depth to 1 */
 	SSL_CTX_set_verify_depth(ssl_ctx,1);
 
+	// don't return from SSL_read()/SSL_write() until success or error (example case: renegotiation of SSL)
+	SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
 
 	ssl = SSL_new(ssl_ctx);
+	SSL_set_connect_state(ssl);
 
 	return true;
 }
@@ -407,7 +394,7 @@ int main(int argc, char **argv)
 	int ret = SSL_connect(ssl);
 	if (ret == 1) {
 		// SSL handshake was successful
-		printf("SSL handshake done\n");
+		printf("Connected to %s:%d\n", ip_address, server_port);
 	} else {
 		fprintf(stderr, "SSL handshake failed\n");
 		clean_and_die(EXIT_FAILURE);
@@ -428,7 +415,7 @@ int main(int argc, char **argv)
 	rl_callback_handler_install(prompt, (rl_vcpfunc_t*) &readline_callback);
 	for (;;) {
 		fd_set rfds;
-		struct timeval timeout;
+		//struct timeval timeout;
 
 		/* You must change this. Keep exitfd[0] in the read set to
 		   receive the message from the signal handler. Otherwise,
@@ -440,10 +427,10 @@ int main(int argc, char **argv)
 		FD_SET(socket_fd, &rfds);
 		max_fd = max(socket_fd, max_fd);
 
-		timeout.tv_sec = 5;
-		timeout.tv_usec = 0;
+		//timeout.tv_sec = 5;
+		//timeout.tv_usec = 0;
 
-		int r = select(max_fd + 1, &rfds, NULL, NULL, &timeout);
+		int r = select(max_fd + 1, &rfds, NULL, NULL, NULL);
 		if (r < 0) {
 			if (errno == EINTR) {
 				/* This should either retry the call or
@@ -456,8 +443,10 @@ int main(int argc, char **argv)
 			break;
 		}
 		if (r == 0) { // timeout
-			write(STDOUT_FILENO, "No message?\n", 12);
-			fsync(STDOUT_FILENO);
+			// since timeout is not implemented, this should not happen
+
+			//write(STDOUT_FILENO, "No message?\n", 12);
+			//fsync(STDOUT_FILENO);
 			/* Whenever you print out a message, call this
 			   to reprint the current input line. */
 			rl_redisplay();
@@ -479,6 +468,7 @@ int main(int argc, char **argv)
 			if (signum == SIGINT || signum == SIGTERM) {
 				/* Clean-up and exit. */
 				printf("\nShutting down...\n");
+				clean_and_die(0);
 				break;
 			}
 		}
@@ -488,21 +478,10 @@ int main(int argc, char **argv)
 
 		if (FD_ISSET(socket_fd, &rfds)) {
 			/* Handle messages from the server here! */
-			GString *received_message = g_string_sized_new(1024);
-			if (!receive_whole_message(ssl, received_message)) {
-				// message was not received or has length 0
-				break;
-			}
-			else {
-				printf("%s\n", received_message->str);
-			}
-			g_string_free(received_message, TRUE);
+			if (!process_server_message())
+				clean_and_die(1);
 		}
-
-
 	}
 
-	/* replace by code to shutdown the connection and exit
-	   the program. */
 	clean_and_die(0);
 }
