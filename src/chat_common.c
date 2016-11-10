@@ -1,5 +1,6 @@
 #include "chat_common.h"
 
+
 /* Receive whole packet from socket.
    Store decrypted data into @message (actual content of message will be discarded) */
 bool read_message(SSL *ssl, GString *message) {
@@ -28,4 +29,10 @@ bool read_message(SSL *ssl, GString *message) {
 	}
 
 	return true;
+}
+
+void print_colored(char *message, char *color)
+{
+	printf("%s%s%s", color, message, ANSI_COLOR_RESET);
+	fflush(stdout);
 }

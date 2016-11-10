@@ -29,19 +29,37 @@
 #endif
 
 
-#define MAX_PASSWD_LENGTH 48
-
 #define CA_CERT "../server.crt"
+
+
+//==================================================
+/**********************
+ ** GLOBAL VARIABLES **
+ **********************/
 
 /* This variable holds a file descriptor of a pipe on which we send a
  * number if a signal is received. */
-
-static const char CA_LOCATION[] = "";
+static int exitfd[2]; // [0] = read, [1] = write
 
 static int socket_fd;
 static SSL_CTX *ssl_ctx;
 static SSL *ssl;
-static int exitfd[2]; // [0] = read, [1] = write
+
+/* This variable shall point to the name of the user. The initial value
+   is NULL. Set this variable to the username once the user managed to be
+   authenticated. */
+static char *user;
+
+/* This variable shall point to the name of the chatroom. The initial
+   value is NULL (not member of a chat room). Set this variable whenever
+   the user changed the chat room successfully. */
+static char *chatroom;
+
+/* This prompt is used by the readline library to ask the user for
+ * input. It is good style to indicate the name of the user and the
+ * chat room he is in as part of the prompt. */
+static char *prompt;
+//==================================================
 
 
 /* If someone kills the client, it should still clean up the readline
@@ -73,6 +91,13 @@ void clean_and_die(int exit_code) {
 
 	close(exitfd[0]);
 	close(exitfd[1]);
+
+	if (prompt)
+		free(prompt);
+	if (chatroom)
+		free(chatroom);
+	if (user)
+		free(user);
 
 	rl_callback_handler_remove();
 
@@ -129,23 +154,6 @@ static void initialize_exitfd(void)
 
 
 
-/* This variable shall point to the name of the user. The initial value
-   is NULL. Set this variable to the username once the user managed to be
-   authenticated. */
-static char *user;
-
-/* This variable shall point to the name of the chatroom. The initial
-   value is NULL (not member of a chat room). Set this variable whenever
-   the user changed the chat room successfully. */
-static char *chatroom;
-
-/* This prompt is used by the readline library to ask the user for
- * input. It is good style to indicate the name of the user and the
- * chat room he is in as part of the prompt. */
-static char *prompt;
-
-
-
 /* When a line is entered using the readline library, this function
    gets called to handle the entered line. Implement the code to
    handle the user requests in this function. The client handles the
@@ -190,7 +198,7 @@ void readline_callback(char *line)
 			rl_redisplay();
 			return;
 		}
-		char *chatroom = strdup(&(line[i]));
+		//char *chatroom = strdup(&(line[i])); // chat room will be set up after confirmation from server
 
 		/* Process and send this information to the server. */
 
@@ -247,7 +255,7 @@ void readline_callback(char *line)
 				return;
 		}
 		char *new_user = strdup(&(line[i]));
-		char passwd[MAX_PASSWD_LENGTH + 1];
+		char passwd[MAX_PASSWORD_LENGTH + 1];
 		getpasswd("Please enter password: ", passwd, sizeof(passwd));
 
 		/* Process and send this information to the server. */
@@ -269,25 +277,129 @@ void readline_callback(char *line)
 	fsync(STDOUT_FILENO);
 }
 
+
+void print_message(int msg_type, char *sender, char *message)
+{
+	char *color_of_message = ANSI_COLOR_RESET;
+
+	switch(msg_type) {
+		case CLIENT_ERROR:
+		case ERROR:
+			color_of_message = ANSI_COLOR_RED;
+			break;
+		case INFO:
+		case CHANGE_ROOM:
+		case LOGGED_IN:
+			color_of_message = ANSI_COLOR_GREEN;
+			break;
+		case ROOM_MESSAGE:
+			break;
+		case PRIVATE_MESSAGE:
+			color_of_message = ANSI_COLOR_MAGENTA;
+			break;
+		case CHALLENGE:
+			color_of_message = ANSI_COLOR_CYAN;
+			break;
+		default:
+			break;
+	}
+
+	time_t now = time(NULL);
+	struct tm *now_tm = gmtime(&now);
+	char timestamp[] = "hh:mm:ss";
+	strftime(timestamp, sizeof timestamp, "%T", now_tm);
+
+	printf("\r[%s] ", timestamp);
+	if (sender) {
+		printf("<");
+		print_colored(sender, color_of_message);
+		printf("> ");
+	}
+	print_colored(message, ANSI_COLOR_RESET);
+	printf("\n");
+}
+
+
 /* return false if server closed connection */
 bool process_server_message()
 {
-	GString *received_message = g_string_sized_new(1024);
-	if (!read_message(ssl, received_message)) {
+
+	GString *received_packet = g_string_sized_new(1024);
+	if (!read_message(ssl, received_packet)) {
 		// connection was probably closed
 		return false;
 	}
 
+	int opcode = *((int *)received_packet->str);
+	char *message = received_packet->str + sizeof(int); // packet without opcode
+	// message won't be larger than incoming packet was
+	GString *output_message = g_string_sized_new(MAX_PACKET_SIZE);; // message what will be print to client's console
+	GString *sender = g_string_sized_new(MAX_USERNAME_LENGTH);; // message what will be print to client's console
+
+/*
+	ERROR,            // for example - room does not exist, username does not exist, bad password, etc.
+	CHANGE_ROOM,      // after receiving this message client can set up internal variable with room
+	LOGGED_IN,        // after receiving this message client can set up internal variable with username
+	MESSAGE,          // just print out message from server (room message) "<OPCODE><USERNAME> <MESSAGE>"
+	PRIVATE_MESSAGE,  // private message (client should print that in different way from room messages) "<OPCODE><USERNAME> <MESSAGE>"
+	CHALLENGE         // challenge from another user (game)
+*/
+	switch (opcode) {
+		case ERROR:
+			g_string_assign(sender, "SERVER");
+			int error = *((int *)message);
+			message = message + sizeof(int); // move pointer after error code
+			if (error == WRONG_PASSWORD) {
+				int num_of_tries = *((int *)message);
+				g_string_printf(output_message, WRONG_PASSWORD_MSG, num_of_tries);
+			} else if (error == WRONG_USERNAME) {
+				int num_of_tries = *((int *)message);
+				g_string_printf(output_message, WRONG_USERNAME_MSG, num_of_tries);
+			}
+			/*else if (error == ROOM_NOT_FOUND) {
+				// not used, since user will create the room if it does not exist
+				// name of room is in the message
+				g_string_printf(output_message, error_message_[ROOM_NOT_FOUND], message);
+			}*/
+			else if (error == UNKNOWN)
+				g_string_printf(output_message, UNKNOWN_ERROR_MSG);
+			break;
+		case INFO:
+			g_string_assign(sender, "SERVER");
+			g_string_assign(output_message, message);
+			break;
+		case CHANGE_ROOM:
+			g_string_assign(sender, "SERVER");
+			g_string_printf(output_message, "You have entered room [%s].", message);
+			chatroom = strdup(message);
+			break;
+		case LOGGED_IN:
+			g_string_assign(sender, "SERVER");
+			g_string_printf(output_message, "Successfully logged in as [%s].", message);
+			user = strdup(message);
+			break;
+		case ROOM_MESSAGE:
+		case PRIVATE_MESSAGE:
+			; // http://stackoverflow.com/questions/18496282/why-do-i-get-a-label-can-only-be-part-of-a-statement-and-a-declaration-is-not-a
+			gchar **msg = g_strsplit(message, " ", 2); // split into username and message
+			if (g_strv_length(msg) == 2) {
+				g_string_assign(sender, msg[0]);
+				g_string_assign(output_message, msg[1]);
+			}
+			else
+				printf("Corrupted packet !!\n");
+			g_strfreev(msg);
+			break;
+		case CHALLENGE:
+			g_string_printf(output_message, "You are challenged to Game of Fortune by [%s]. Use /accept or /decline to answer.", message);
+			break;
+	}
+	print_message(opcode, sender->str, output_message->str);
 
 
-	// PROCESS PACKET (MESSAGE) from server HERE
-	printf("%s\n", received_message->str);
-	// PROCESS PACKET (MESSAGE) from server HERE
-
-
-
-
-	g_string_free(received_message, TRUE);
+	g_string_free(received_packet, TRUE);
+	g_string_free(output_message, TRUE);
+	g_string_free(sender, TRUE);
 	return true;
 }
 
@@ -417,9 +529,6 @@ int main(int argc, char **argv)
 		fd_set rfds;
 		//struct timeval timeout;
 
-		/* You must change this. Keep exitfd[0] in the read set to
-		   receive the message from the signal handler. Otherwise,
-		   the chat client can break in terrible ways. */
 		FD_ZERO(&rfds);
 		FD_SET(STDIN_FILENO, &rfds);
 		FD_SET(exitfd[0], &rfds);

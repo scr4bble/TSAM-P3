@@ -49,6 +49,11 @@ static GQueue *clients_write_queue;
 
 
 typedef struct ClientConnection {
+
+	// int num_of_tries;  // reminining number of tries to login
+	// GString *room;     // chat room
+	// GString *username; // username after successful login
+
 	SSL *ssl;
 	bool ssl_handshake_done;
 	int conn_fd;
@@ -102,7 +107,7 @@ ClientConnection* new_ClientConnection(int conn_fd) {
 void destroy_ClientConnection(ClientConnection *connection) {
 
 	log_msg(connection, "disconnected");
-
+	SSL_shutdown(connection->ssl);
 	SSL_free(connection->ssl);
 	close(connection->conn_fd); // close socket with client connection
 	g_timer_destroy(connection->conn_timer); // destroy timer
@@ -163,15 +168,15 @@ void sig_handler(int signal_n) {
 
 /* Encrypt message and try to send it through ssl connection.
  */
-bool write_message(ClientConnection *connection, char *message) {
+bool write_message(ClientConnection *connection, char *message, int len) {
 
 	ERR_clear_error();
-	ssize_t n = SSL_write(connection->ssl, message, strlen(message));
+	int n = SSL_write(connection->ssl, message, len);
 	int error = SSL_get_error(connection->ssl, n);
 
 	switch (error) {
 		case SSL_ERROR_NONE:
-			if (n == strlen(message)) {
+			if (n == len) {
 				//printf("whole message sent successfully\n");
 				g_queue_remove(clients_write_queue, connection);
 				g_string_truncate(connection->write_buffer, 0);
@@ -181,7 +186,7 @@ bool write_message(ClientConnection *connection, char *message) {
 		case SSL_ERROR_WANT_WRITE:
 			if (!g_queue_find(clients_write_queue, connection))
 				g_queue_push_tail(clients_write_queue, connection);
-			g_string_assign(connection->write_buffer, message);
+				g_string_assign(connection->write_buffer, message);
 			return true;
 		default:
 			// perror("SSL_write error");
@@ -312,21 +317,35 @@ bool try_perform_ssl_handshake (ClientConnection *connection) {
 }
 
 
+GString* build_packet(int opcode, char *message)
+{
+	GString *packet = g_string_sized_new(MAX_PACKET_SIZE);
+
+	// write opcode in binary form at the start of the packet
+	g_string_append_len(packet, (char *)(&opcode), sizeof(int));
+	g_string_append(packet, message);
+
+	return packet;
+}
+
+
+
 /* Processes the request of client and builds a response,
    using recieve_whole_message, parse_request, create_html_page and log_msg */
 void handle_connection(ClientConnection *connection) {
 
 	g_timer_start(connection->conn_timer); // reset timer
+	GString *response;
 
 	// if SSL handshake was not performed yet
 	if (!connection->ssl_handshake_done) {
 		if (try_perform_ssl_handshake(connection)) {
-			write_message(connection, "Welcome");
+			response = build_packet(INFO, "Welcome");
+			write_message(connection, response->str, response->len);
+			g_string_free(response, TRUE);
 		}
 		return;
 	}
-
-	GString *response = g_string_sized_new(MAX_PACKET_SIZE);
 
 	// Receiving packet from socket
 	GString *received_message = g_string_sized_new(MAX_PACKET_SIZE);
@@ -342,10 +361,10 @@ void handle_connection(ClientConnection *connection) {
 
 	g_string_append(response, "Encrypted greetings from server :)");
 
-	write_message(connection, response->str);
+	write_message(connection, response->str, response->len);
 
 	g_string_free(received_message, TRUE);
-	g_string_free(response, TRUE);
+
 	printf("\n"); // empty line
 
 	return;
@@ -366,7 +385,7 @@ void handle_socket_if_waiting(ClientConnection *connection, fd_set *readfds) {
 void send_message_if_ready(ClientConnection *connection, fd_set *writefds) {
 
 	if (FD_ISSET(connection->conn_fd, writefds)) {
-		write_message(connection, connection->write_buffer->str);
+		write_message(connection, connection->write_buffer->str, connection->write_buffer->len);
 	}
 }
 
