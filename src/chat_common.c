@@ -2,13 +2,15 @@
 
 
 /* Receive whole packet from socket.
-   Store decrypted data into @message (actual content of message will be discarded) */
-bool read_message(SSL *ssl, GString *message) {
+   Store decrypted data into @packet (actual content of packet will be discarded) */
+bool recv_packet(SSL *ssl, GString *packet) {
 
 	const ssize_t BUFFER_SIZE = 1024;
 	ssize_t n = 0;
 	char buffer[BUFFER_SIZE];
-	g_string_truncate (message, 0); // empty provided GString variable
+	memset(&buffer, 0, sizeof(buffer));
+
+	g_string_truncate (packet, 0); // empty provided GString variable
 
 	ERR_clear_error();
 	n = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
@@ -17,7 +19,7 @@ bool read_message(SSL *ssl, GString *message) {
 	switch (error) {
 		case SSL_ERROR_NONE:
 			buffer[n] = '\0'; // just in case, not needed
-			g_string_append_len(message, buffer, n);
+			g_string_append_len(packet, buffer, n);
 			break;
 		case SSL_ERROR_WANT_READ:
 		case SSL_ERROR_WANT_WRITE:

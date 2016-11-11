@@ -32,12 +32,17 @@
 #define KEEP_ALIVE_TIMEOUT 30
 
 
-#define SERVER_CERT_FILE "../server.crt"
-#define SERVER_KEY_FILE "../server.key"
+#define SERVER_CERT_FILE "server.crt"
+#define SERVER_KEY_FILE "server.key"
 
 
 // welcome message
 static const char WELCOME_MSG[] = "Welcome";
+
+// variable for buffering outcoming packets
+// DON'T USE OUTSIDE build_and_send_packet() function !!!
+static GString *packet;
+static GString *temp_string;
 
 static SSL_CTX *ssl_ctx; // encryption for sockets
 static int sockfd; // master socket (server listening socket)
@@ -50,9 +55,10 @@ static GQueue *clients_write_queue;
 
 typedef struct ClientConnection {
 
-	// int num_of_tries;  // reminining number of tries to login
-	// GString *room;     // chat room
-	// GString *username; // username after successful login
+	int num_of_tries;  // reminining number of tries to login
+	GString *chatroom;     // chat room
+	GString *username; // username after successful login
+	// GString *game_oponent;
 
 	SSL *ssl;
 	bool ssl_handshake_done;
@@ -65,8 +71,8 @@ typedef struct ClientConnection {
 
 
 /* Function for printing log messages to output. */
-void log_msg(ClientConnection *connection, char *message) {
-
+void log_msg(ClientConnection *connection, char *message)
+{
 	time_t now = time(NULL);
 	struct tm *now_tm = gmtime(&now);
 	char iso_8601[] = "YYYY-MM-DDThh:mm:ssTZD";
@@ -74,11 +80,14 @@ void log_msg(ClientConnection *connection, char *message) {
 
 	printf("%s : %s:%d %s\n", iso_8601, inet_ntoa(connection->client_sockaddr.sin_addr),
 			ntohs(connection->client_sockaddr.sin_port), message);
+
+	fflush(stdout);
 }
 
 
 /* When a new client wishes to establish a connection, we create the connection and add it to the queue */
-ClientConnection* new_ClientConnection(int conn_fd) {
+ClientConnection* new_ClientConnection(int conn_fd)
+{
 	ClientConnection *connection = g_new0(ClientConnection, 1);
 	// find out client IP and port
 	int addrlen = sizeof(connection->client_sockaddr);
@@ -88,6 +97,10 @@ ClientConnection* new_ClientConnection(int conn_fd) {
 	connection->conn_timer = g_timer_new();
 	connection->cookie_token = g_string_new(NULL);
 	connection->write_buffer = g_string_new(NULL);
+
+	connection->chatroom = g_string_new(NULL);
+	connection->username = g_string_new(NULL);
+	connection->num_of_tries = 3;
 
 	connection->ssl_handshake_done = false;
 	connection->ssl = SSL_new(ssl_ctx);
@@ -104,8 +117,8 @@ ClientConnection* new_ClientConnection(int conn_fd) {
 
 /* Destroy/close/free instance of ClientConnection.
    @connection has to be allocated by malloc() */
-void destroy_ClientConnection(ClientConnection *connection) {
-
+void destroy_ClientConnection(ClientConnection *connection)
+{
 	log_msg(connection, "disconnected");
 	SSL_shutdown(connection->ssl);
 	SSL_free(connection->ssl);
@@ -113,28 +126,33 @@ void destroy_ClientConnection(ClientConnection *connection) {
 	g_timer_destroy(connection->conn_timer); // destroy timer
 	g_string_free(connection->cookie_token, TRUE);
 	g_string_free(connection->write_buffer, TRUE);
+	g_string_free(connection->chatroom, TRUE);
+	g_string_free(connection->username, TRUE);
 	g_free(connection); // free memory allocated for this instance of ClientConnection
 }
 
 /* Takes a connection from the queue and runs destroy_ClientConnection function */
-void remove_ClientConnection(ClientConnection *connection) {
+void remove_ClientConnection(ClientConnection *connection)
+{
 	destroy_ClientConnection(connection);
 	if (!g_queue_remove(clients_queue, connection)) {
 		printf("Something is wrong. Connection was not found in queue.\n");
 	}
+	g_queue_remove(clients_write_queue, connection); // just in case the connection was in this queue
 }
 
 /* Runs through the queue of clients and runs remove_ClientConnection for every instance in it,
    then frees the memory */
-void destroy_clients_queue(GQueue *clients_queue) {
+void destroy_clients_queue(GQueue *clients_queue)
+{
 	g_queue_foreach(clients_queue, (GFunc) remove_ClientConnection, NULL);
 	g_queue_free(clients_queue);
 }
 
 
 /* Closes the connection of both socket and file writer, runs destroy_clients_queue function and exits program */
-void clean_and_die(int exit_code) {
-
+void clean_and_die(int exit_code)
+{
 	/* Close the connections. */
 	// http://stackoverflow.com/questions/4160347/close-vs-shutdown-socket
 	shutdown(sockfd, SHUT_RDWR);
@@ -148,8 +166,11 @@ void clean_and_die(int exit_code) {
 
 	destroy_clients_queue(clients_queue);
 	clients_queue = NULL;
-
 	g_queue_free(clients_write_queue);
+	clients_write_queue = NULL;
+
+	g_string_free(packet, TRUE);
+	g_string_free(temp_string, TRUE);
 
 	//g_hash_table_destroy(cookies);
 
@@ -158,7 +179,8 @@ void clean_and_die(int exit_code) {
 
 
 /* Signal handler function that closes down program, by running clean_and_die function */
-void sig_handler(int signal_n) {
+void sig_handler(int signal_n)
+{
 	if (signal_n == SIGINT) {
 		printf("\nShutting down...\n");
 	}
@@ -166,18 +188,18 @@ void sig_handler(int signal_n) {
 }
 
 
-/* Encrypt message and try to send it through ssl connection.
+/* Encrypt packet and try to send it through ssl connection.
  */
-bool write_message(ClientConnection *connection, char *message, int len) {
-
+bool send_packet(ClientConnection *connection, char *packet, int len)
+{
 	ERR_clear_error();
-	int n = SSL_write(connection->ssl, message, len);
+	int n = SSL_write(connection->ssl, packet, len);
 	int error = SSL_get_error(connection->ssl, n);
 
 	switch (error) {
 		case SSL_ERROR_NONE:
 			if (n == len) {
-				//printf("whole message sent successfully\n");
+				//printf("whole packet sent successfully\n");
 				g_queue_remove(clients_write_queue, connection);
 				g_string_truncate(connection->write_buffer, 0);
 				return true;
@@ -186,7 +208,7 @@ bool write_message(ClientConnection *connection, char *message, int len) {
 		case SSL_ERROR_WANT_WRITE:
 			if (!g_queue_find(clients_write_queue, connection))
 				g_queue_push_tail(clients_write_queue, connection);
-				g_string_assign(connection->write_buffer, message);
+				g_string_assign(connection->write_buffer, packet);
 			return true;
 		default:
 			// perror("SSL_write error");
@@ -196,19 +218,33 @@ bool write_message(ClientConnection *connection, char *message, int len) {
 }
 
 
+void build_and_send_packet(ClientConnection *connection, const int opcode, const char *message)
+{
+	g_string_truncate(packet, 0);
+
+	// write opcode in binary form at the start of the packet
+	g_string_append_len(packet, (char *)(&opcode), sizeof(int));
+	g_string_append(packet, message);
+
+	send_packet(connection, packet->str, packet->len);
+}
+
 
 /* Add child socket to set */
-void add_socket_into_set(ClientConnection *connection, fd_set *readfds_ptr) {
+void add_socket_into_set(ClientConnection *connection, fd_set *readfds_ptr)
+{
 	FD_SET(connection->conn_fd, readfds_ptr);
 }
 
 /* A helper function to find the connection with highest sockfd */
-void max_sockfd(ClientConnection *connection, int *max) {
+void max_sockfd(ClientConnection *connection, int *max)
+{
 	*max = max(connection->conn_fd, *max);
 }
 
 /* Runs max_sockfd for every client in queue and returns the higest value */
-int return_max_sockfd_in_queue(GQueue *clients_queue) {
+int return_max_sockfd_in_queue(GQueue *clients_queue)
+{
 	int max = 0;
 	g_queue_foreach(clients_queue, (GFunc) max_sockfd, &max);
 	return max;
@@ -217,7 +253,8 @@ int return_max_sockfd_in_queue(GQueue *clients_queue) {
 
 
 /* Check timer of the connection and close/destroy connection if time exceeded KEEP_ALIVE_TIMEOUT seconds */
-void check_timer(ClientConnection *connection) {
+void check_timer(ClientConnection *connection)
+{
 
 	gdouble seconds_elapsed = g_timer_elapsed(connection->conn_timer, NULL);
 	if (seconds_elapsed >= MAX_IDLE_TIME) {
@@ -229,65 +266,177 @@ void check_timer(ClientConnection *connection) {
 	}
 }
 
-
-
-/* Uses the data that was fetched in recieve_whole_message and parses it into a Request */
-void parse_received_msg(GString *received_message) {
-
-	// parse received message // get inspirated by some protocols or httpd.c (maybe use headers, base64 for text, some delimiter for separating body, etc.)
-
-
-	/*
-	// truncate message body so only headers will left
-	g_string_truncate(received_message, headers_length);
-
-	// split message to headers
-	gchar *start_of_headers = g_strstr_len(received_message->str, received_message->len, "\r\n");
-	gchar **headers_arr = g_strsplit_set(start_of_headers, "\r\n", 0);
-
-	// for each header line
-	for (unsigned int i = 0; i < g_strv_length(headers_arr); i++) {
-
-		// headers can also contains empty lines because "\r\n" are understood as two delimiters in split command
-		if (strlen(headers_arr[i]) == 0)
-			continue;
-
-		gchar **header_line = g_strsplit_set(headers_arr[i], ":", 2);
-		if (g_strv_length(header_line) != 2) {
-			printf("WRONG FORMAT OF HEADER\n");
-			g_strfreev(headers_arr);
-			g_strfreev(header_line);
-			return false;
-		}
-
-		gchar *header_name = g_ascii_strdown(header_line[0], -1); // convert to lowercase (arg. -1 if string is NULL terminated)
-		gchar *header_value = g_strdup(header_line[1]);
-		g_strstrip(header_value); // strip leading and trailing whitespaces
-		g_strfreev(header_line); // free splitted line
-
-		g_hash_table_insert(request->headers, header_name, header_value);
-		// gchar *value = g_hash_table_lookup(hash_table, "key")
-		// g_free(gchar *pointer);
-
-		if (g_strcmp0(header_name, "host") == 0) {
-			g_string_assign(request->host, header_value);
-		}
-		if (g_strcmp0(header_name, "connection") == 0) {
-			if (g_strcmp0(header_value, "close") == 0)
-				request->connection_close = true;
-			if (!default_persistent && g_strcmp0(header_value, "keep-alive") != 0)
-				request->connection_close = true;
-		}
+bool user_logged_in(ClientConnection *client) {
+	if (client->username->len == 0) {
+		build_and_send_packet(client, ERROR, "You must log in first. Use '/user <username>'.");
+		return false;
 	}
-	g_strfreev(headers_arr);
+	return true;
+}
 
-	*/
-
+bool user_member_of_chatroom(ClientConnection *client) {
+	if (client->chatroom->len == 0) {
+		build_and_send_packet(client, ERROR, "You are not a member of any room. Use '/join <room>'");
+		return false;
+	}
+	return true;
 }
 
 
-bool try_perform_ssl_handshake (ClientConnection *connection) {
+void send_list_of_all_users(ClientConnection *connection)
+{
+	return;
+}
 
+
+void send_list_of_all_rooms(ClientConnection *connection)
+{
+	return;
+}
+
+
+// NEED TO REWRITE
+void join_chat_room(ClientConnection *connection, const char *room)
+{
+	// TODO
+	if (user_logged_in(connection)) {
+		g_string_printf(temp_string, "joined room %s", room);
+		log_msg(connection, temp_string->str);
+		g_string_assign(connection->chatroom, room);
+		// TODO - change this for working authentication
+		build_and_send_packet(connection, CHANGE_ROOM, room);
+	}
+}
+
+// NEED TO REWRITE
+void login_user(ClientConnection *connection, const char *username, const char *password)
+{
+	log_msg(connection, "authenticated");
+	g_string_assign(connection->username, username);
+	// TODO - change this for working authentication
+	build_and_send_packet(connection, LOGGED_IN, username);
+	//#define WRONG_PASSWORD_MSG "Authentication failed (wrong password). Remaining tries: %d."
+	//#define WRONG_USERNAME_MSG "Authentication failed (wrong username). Remaining tries: %d."
+	return;
+}
+
+
+void send_private_message(ClientConnection *sender, const char *recipient, const char *message)
+{
+	return;
+}
+
+// send message to each client in the room where the client is (if any)
+void send_message(ClientConnection *sender, const char *message)
+{
+	if (user_logged_in(sender)) {
+		if (user_member_of_chatroom(sender)) {
+			// send packet to everybody in the chatroom
+			// TODO (delete this sending and rewrite it to foreach cycle through all client in the room)
+			g_string_printf(temp_string, "%s %s", sender->username->str, message);
+			build_and_send_packet(sender, ROOM_MESSAGE, temp_string->str);
+		}
+	}
+	return;
+}
+
+
+void game(ClientConnection *challenger, const char *challenged_user)
+{
+	return;
+}
+
+
+void roll(ClientConnection *connection)
+{
+	return;
+}
+
+
+void accept_game(ClientConnection *connection)
+{
+	return;
+}
+
+
+void decline_game(ClientConnection *connection)
+{
+	return;
+}
+
+
+void send_test_message(ClientConnection *connection)
+{
+	build_and_send_packet(connection, ROOM_MESSAGE, "username message");
+}
+
+
+void parse_client_message(ClientConnection *connection, GString *received_packet)
+{
+	int opcode = *((int *)received_packet->str);
+	char *message = received_packet->str + sizeof(int); // packet without opcode
+
+/*
+	WHO,      //  /who          # list of all users
+	LIST,     //  /list         # list of all rooms
+	JOIN,     //  /join <room>
+	USER,     //  /user <username> <password>    # login
+	SAY,      //  /say <username> <msg>          # private message
+	//BYE,    //  /bye   # maybe just close the connection after this command
+	MSG,      //  <MSG_opcode> <message>
+	GAME,     //  /game <username>
+	ROLL,     //  /roll
+	ACCEPT,   //  /accept
+	DECLINE   //  /decline
+*/
+	switch(opcode) {
+		case WHO:
+			send_list_of_all_users(connection);
+			break;
+		case LIST:
+			send_list_of_all_rooms(connection);
+			break;
+		case JOIN:
+			join_chat_room(connection, message);
+			break;
+		case USER:
+		case SAY: ; // empty statement
+			gchar **msg = g_strsplit(message, " ", 2); // split into username and message
+			if (g_strv_length(msg) == 2) {
+				const char *user = msg[0];
+				if (opcode == USER) { // user trying to login
+					const char *passwd = msg[1];
+					login_user(connection, user, passwd);
+				} else { // opcode == SAY (private message)
+					send_private_message(connection, user, msg[1]);
+				}
+			}
+			else
+				printf("Corrupted packet !!\n");
+			g_strfreev(msg);
+			break;
+		case MSG:
+			send_message(connection, message);
+			break;
+		case GAME:
+			game(connection, message);
+			break;
+		case ROLL:
+			roll(connection);
+			break;
+		case ACCEPT:
+			accept_game(connection);
+			break;
+		case DECLINE:
+			decline_game(connection);
+			break;
+
+	}
+}
+
+
+bool try_to_perform_ssl_handshake (ClientConnection *connection)
+{
 	ERR_clear_error();
 	int ret = SSL_accept(connection->ssl);
 	if (ret == 1) {
@@ -317,64 +466,44 @@ bool try_perform_ssl_handshake (ClientConnection *connection) {
 }
 
 
-GString* build_packet(int opcode, char *message)
-{
-	GString *packet = g_string_sized_new(MAX_PACKET_SIZE);
 
-	// write opcode in binary form at the start of the packet
-	g_string_append_len(packet, (char *)(&opcode), sizeof(int));
-	g_string_append(packet, message);
-
-	return packet;
-}
 
 
 
 /* Processes the request of client and builds a response,
    using recieve_whole_message, parse_request, create_html_page and log_msg */
-void handle_connection(ClientConnection *connection) {
-
+void handle_connection(ClientConnection *connection)
+{
 	g_timer_start(connection->conn_timer); // reset timer
-	GString *response;
 
 	// if SSL handshake was not performed yet
 	if (!connection->ssl_handshake_done) {
-		if (try_perform_ssl_handshake(connection)) {
-			response = build_packet(INFO, "Welcome");
-			write_message(connection, response->str, response->len);
-			g_string_free(response, TRUE);
+		if (try_to_perform_ssl_handshake(connection)) {
+			build_and_send_packet(connection, INFO, "Welcome");
 		}
 		return;
 	}
 
 	// Receiving packet from socket
 	GString *received_message = g_string_sized_new(MAX_PACKET_SIZE);
-	if (!read_message(connection->ssl, received_message)) {
+	if (!recv_packet(connection->ssl, received_message)) {
 		// message was not received or has length 0
 		remove_ClientConnection(connection);
 		return;
 	}
-	//printf("Received:\n%s\n", received_message->str);
 
 	// parse message from client
-	parse_received_msg(received_message);
-
-	g_string_append(response, "Encrypted greetings from server :)");
-
-	write_message(connection, response->str, response->len);
+	parse_client_message(connection, received_message);
 
 	g_string_free(received_message, TRUE);
-
-	printf("\n"); // empty line
-
 	return;
 }
 
 
 
 /* check if socket is in the set of waiting sockets and handle connection if it is */
-void handle_socket_if_waiting(ClientConnection *connection, fd_set *readfds) {
-
+void handle_socket_if_waiting(ClientConnection *connection, fd_set *readfds)
+{
 	if (FD_ISSET(connection->conn_fd, readfds)) {
 		handle_connection(connection);
 	}
@@ -382,17 +511,18 @@ void handle_socket_if_waiting(ClientConnection *connection, fd_set *readfds) {
 
 
 /* check if there is a socket ready for writing and send write_buffer to client */
-void send_message_if_ready(ClientConnection *connection, fd_set *writefds) {
-
+void send_message_if_ready(ClientConnection *connection, fd_set *writefds)
+{
 	if (FD_ISSET(connection->conn_fd, writefds)) {
-		write_message(connection, connection->write_buffer->str, connection->write_buffer->len);
+		send_packet(connection, connection->write_buffer->str, connection->write_buffer->len);
 	}
 }
 
 
 /* A looping function that waits for incoming connection, adds it
    to the queue and attempts to processes all clients waiting in the queue */
-void run_loop() {
+void run_loop()
+{
 	struct sockaddr_in client;
 	int max_sockfd;
 
@@ -427,6 +557,8 @@ void run_loop() {
 		}
 		else if (retval == 0) { // timeout
 			g_queue_foreach(clients_queue, (GFunc) check_timer, NULL);
+
+			//g_queue_foreach(clients_queue, (GFunc) send_test_message, NULL);
 			continue;
 		}
 
@@ -443,7 +575,7 @@ void run_loop() {
 			//add new client into the queue
 			ClientConnection *new_client = new_ClientConnection(conn_fd);
 
-			log_msg(new_client, "New connection");
+			log_msg(new_client, "new connection");
 
 			handle_connection(new_client);
 		}
@@ -570,6 +702,8 @@ bool start_listening(int server_port)
 int main(int argc, char **argv)
 {
 	errno = 0; // reset
+	packet = g_string_sized_new(MAX_PACKET_SIZE);
+	temp_string = g_string_sized_new(MAX_PACKET_SIZE);
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <port>\n", argv[0]);

@@ -27,10 +27,10 @@ distclean: clean
 	rm -f chatd chat
 
 run-server:
-	./chatd $(SERVER_PORT)
+	cd ..; ./src/chatd $(SERVER_PORT)
 
 run-client:
-	./chat 127.0.0.1 $(SERVER_PORT)
+	cd ..; ./src/chat 127.0.0.1 $(SERVER_PORT)
 
 zip:
 	cd ..; zip chat.zip README src/*.c src/Makefile AUTHORS

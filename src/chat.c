@@ -29,7 +29,7 @@
 #endif
 
 
-#define CA_CERT "../server.crt"
+#define CA_CERT "server.crt"
 
 
 //==================================================
@@ -40,6 +40,11 @@
 /* This variable holds a file descriptor of a pipe on which we send a
  * number if a signal is received. */
 static int exitfd[2]; // [0] = read, [1] = write
+
+// variable for buffering outcoming packets
+// DON'T USE OUTSIDE build_and_send_packet() function !!!
+static GString *packet;
+static GString *temp_string;
 
 static int socket_fd;
 static SSL_CTX *ssl_ctx;
@@ -58,7 +63,7 @@ static char *chatroom;
 /* This prompt is used by the readline library to ask the user for
  * input. It is good style to indicate the name of the user and the
  * chat room he is in as part of the prompt. */
-static char *prompt;
+static GString *prompt;
 //==================================================
 
 
@@ -92,14 +97,16 @@ void clean_and_die(int exit_code) {
 	close(exitfd[0]);
 	close(exitfd[1]);
 
-	if (prompt)
-		free(prompt);
 	if (chatroom)
 		free(chatroom);
 	if (user)
 		free(user);
 
 	rl_callback_handler_remove();
+
+	g_string_free(prompt, true);
+	g_string_free(packet, true);
+	g_string_free(temp_string, true);
 
 	exit(exit_code);
 }
@@ -153,6 +160,131 @@ static void initialize_exitfd(void)
 }
 
 
+void update_prompt()
+{
+	// reset prompt
+	g_string_truncate(prompt, 0);
+
+	if (user) {
+		g_string_append_printf(prompt, "(%s) ", user);
+	}
+	if (chatroom) {
+		g_string_append_printf(prompt, "#%s ", chatroom);
+	}
+
+	g_string_append(prompt, "> ");
+
+	rl_set_prompt(prompt->str);
+}
+
+
+
+/* Build packet and try to send it through encrypted ssl connection.
+ * @len - how many bytes of @message will be dispatched
+ */
+void build_and_send_packet(int opcode, const char *message, int len)
+{
+
+	g_string_truncate(packet, 0);
+
+	// write opcode in binary form at the start of the packet
+	g_string_append_len(packet, (char *)(&opcode), sizeof(int));
+	g_string_append(packet, message);
+
+	ERR_clear_error();
+	if (len <= 0) // if there are not doubts that message can fit into one packet
+		len = packet->len;
+	else
+		len += sizeof(int); // adding size of opcode
+
+	int n = SSL_write(ssl, packet->str, len);
+
+	if (n <= 0) {
+		// perror("SSL_write error");
+		// probably closed connection
+		rl_callback_handler_remove();
+		signal_handler(SIGTERM);
+	}
+
+}
+
+// Username can contain only \"A-Za-z0-9._-|\" and must be max. MAX_USERNAME_LENGTH characters long.
+bool check_username(char *username)
+{
+	int username_length = strlen(username);
+
+	if (username_length > MAX_USERNAME_LENGTH)
+		return false;
+
+	for (int i = 0; i < username_length; ++i)
+	{
+		if ((username[i] < '0' || username[i] > '9') &&
+			(username[i] < 'a' || username[i] > 'z') &&
+			(username[i] < 'A' || username[i] > 'Z') &&
+			(username[i] != '_') && (username[i] != '-') &&
+			(username[i] != '.') && (username[i] != '|'))
+			return false;
+	}
+	return true;
+}
+
+
+void print_message(int msg_type, char *sender, char *message)
+{
+	char *color = ANSI_COLOR_RESET;
+
+	switch(msg_type) {
+		case CLIENT_ERROR:
+		case ERROR:
+			color = ANSI_COLOR_RED;
+			break;
+		case INFO:
+		case CHANGE_ROOM:
+		case LOGGED_IN:
+			color = ANSI_COLOR_GREEN;
+			break;
+		case ROOM_MESSAGE:
+			break;
+		case PRIVATE_MESSAGE_SENT:
+		case PRIVATE_MESSAGE_RECEIVED:
+			color = ANSI_COLOR_MAGENTA;
+			break;
+		case CHALLENGE:
+			color = ANSI_COLOR_CYAN;
+			break;
+		default:
+			break;
+	}
+
+	time_t now = time(NULL);
+
+	struct tm *now_tm = gmtime(&now);
+	char timestamp[] = "hh:mm:ss";
+	strftime(timestamp, sizeof timestamp, "%T", now_tm);
+
+	g_string_printf(temp_string, "\r[%s] ", timestamp);
+	print_colored(temp_string->str, ANSI_COLOR_CYAN);
+	if (sender) {
+		if (msg_type == PRIVATE_MESSAGE_SENT)
+			printf("to ");
+		printf("<");
+		print_colored(sender, color);
+		printf("> ");
+	}
+	print_colored(message, ANSI_COLOR_RESET);
+	printf("\n");
+	rl_forced_update_display();
+}
+
+
+void clear_line()
+{
+	rl_set_prompt("");
+	rl_replace_line("", 0);
+	rl_redisplay();
+	update_prompt();
+}
+
 
 /* When a line is entered using the readline library, this function
    gets called to handle the entered line. Implement the code to
@@ -198,14 +330,8 @@ void readline_callback(char *line)
 			rl_redisplay();
 			return;
 		}
-		//char *chatroom = strdup(&(line[i])); // chat room will be set up after confirmation from server
-
-		/* Process and send this information to the server. */
-
-		/* Maybe update the prompt. */
-		free(prompt);
-		prompt = NULL; /* What should the new prompt look like? */
-		rl_set_prompt(prompt);
+		const char *room = &(line[i]);
+		build_and_send_packet(JOIN, room, strlen(room));
 		return;
 	}
 	if (strncmp("/list", line, 5) == 0) {
@@ -254,70 +380,50 @@ void readline_callback(char *line)
 				rl_redisplay();
 				return;
 		}
-		char *new_user = strdup(&(line[i]));
+		char *new_user = &(line[i]);
+		if (!check_username(new_user)) {
+			char error_message[512];
+			sprintf(error_message, "Username can contain only \"A-Za-z0-9._-|\" and must be max. %d characters long.", MAX_USERNAME_LENGTH);
+			print_message(CLIENT_ERROR, "CLIENT", error_message);
+			clear_line();
+			return;
+		}
+
 		char passwd[MAX_PASSWORD_LENGTH + 1];
 		getpasswd("Please enter password: ", passwd, sizeof(passwd));
 
-		/* Process and send this information to the server. */
-		printf("Do something with the password <<%s>>\n", passwd);
+		if (strlen(passwd) > MAX_PASSWORD_LENGTH) {
+			char error_message[512];
+			sprintf(error_message, "Password must be max. %d characters long.", MAX_PASSWORD_LENGTH);
+			print_message(CLIENT_ERROR, "CLIENT", error_message);
+			clear_line();
+			return;
+		}
 
-		/* Maybe update the prompt. */
-		free(prompt);
-		prompt = NULL; /* What should the new prompt look like? */
-		rl_set_prompt(prompt);
+		g_string_assign(temp_string, new_user);
+		g_string_append_printf(temp_string, " %s", passwd);
+		build_and_send_packet(USER, temp_string->str, temp_string->len);
+
 		return;
 	}
 	if (strncmp("/who", line, 4) == 0) {
 		/* Query all available users */
 		return;
 	}
+	if (strncmp("/", line, 1) == 0) {
+		print_message(CLIENT_ERROR, "CLIENT", "Unknown command.");
+		rl_redisplay();
+		return;
+	}
 	/* Sent the buffer to the server. */
-	snprintf(buffer, 255, "Message: %s\n", line);
-	write(STDOUT_FILENO, buffer, strlen(buffer));
-	fsync(STDOUT_FILENO);
+	// split line to more messages if necessary
+	for (int msg_len = strlen(line); msg_len > MAX_MESSAGE_SIZE; msg_len -= MAX_MESSAGE_SIZE) {
+		build_and_send_packet(MSG, line, MAX_MESSAGE_SIZE);
+		line += MAX_MESSAGE_SIZE;
+	}
+	build_and_send_packet(MSG, line, strlen(line));
 }
 
-
-void print_message(int msg_type, char *sender, char *message)
-{
-	char *color_of_message = ANSI_COLOR_RESET;
-
-	switch(msg_type) {
-		case CLIENT_ERROR:
-		case ERROR:
-			color_of_message = ANSI_COLOR_RED;
-			break;
-		case INFO:
-		case CHANGE_ROOM:
-		case LOGGED_IN:
-			color_of_message = ANSI_COLOR_GREEN;
-			break;
-		case ROOM_MESSAGE:
-			break;
-		case PRIVATE_MESSAGE:
-			color_of_message = ANSI_COLOR_MAGENTA;
-			break;
-		case CHALLENGE:
-			color_of_message = ANSI_COLOR_CYAN;
-			break;
-		default:
-			break;
-	}
-
-	time_t now = time(NULL);
-	struct tm *now_tm = gmtime(&now);
-	char timestamp[] = "hh:mm:ss";
-	strftime(timestamp, sizeof timestamp, "%T", now_tm);
-
-	printf("\r[%s] ", timestamp);
-	if (sender) {
-		printf("<");
-		print_colored(sender, color_of_message);
-		printf("> ");
-	}
-	print_colored(message, ANSI_COLOR_RESET);
-	printf("\n");
-}
 
 
 /* return false if server closed connection */
@@ -325,7 +431,7 @@ bool process_server_message()
 {
 
 	GString *received_packet = g_string_sized_new(1024);
-	if (!read_message(ssl, received_packet)) {
+	if (!recv_packet(ssl, received_packet)) {
 		// connection was probably closed
 		return false;
 	}
@@ -333,8 +439,8 @@ bool process_server_message()
 	int opcode = *((int *)received_packet->str);
 	char *message = received_packet->str + sizeof(int); // packet without opcode
 	// message won't be larger than incoming packet was
-	GString *output_message = g_string_sized_new(MAX_PACKET_SIZE);; // message what will be print to client's console
-	GString *sender = g_string_sized_new(MAX_USERNAME_LENGTH);; // message what will be print to client's console
+	GString *output_message = g_string_sized_new(MAX_PACKET_SIZE); // message what will be print to client's console
+	GString *sender = g_string_sized_new(MAX_USERNAME_LENGTH); // message what will be print to client's console
 
 /*
 	ERROR,            // for example - room does not exist, username does not exist, bad password, etc.
@@ -347,22 +453,7 @@ bool process_server_message()
 	switch (opcode) {
 		case ERROR:
 			g_string_assign(sender, "SERVER");
-			int error = *((int *)message);
-			message = message + sizeof(int); // move pointer after error code
-			if (error == WRONG_PASSWORD) {
-				int num_of_tries = *((int *)message);
-				g_string_printf(output_message, WRONG_PASSWORD_MSG, num_of_tries);
-			} else if (error == WRONG_USERNAME) {
-				int num_of_tries = *((int *)message);
-				g_string_printf(output_message, WRONG_USERNAME_MSG, num_of_tries);
-			}
-			/*else if (error == ROOM_NOT_FOUND) {
-				// not used, since user will create the room if it does not exist
-				// name of room is in the message
-				g_string_printf(output_message, error_message_[ROOM_NOT_FOUND], message);
-			}*/
-			else if (error == UNKNOWN)
-				g_string_printf(output_message, UNKNOWN_ERROR_MSG);
+			g_string_assign(output_message, message);
 			break;
 		case INFO:
 			g_string_assign(sender, "SERVER");
@@ -372,14 +463,17 @@ bool process_server_message()
 			g_string_assign(sender, "SERVER");
 			g_string_printf(output_message, "You have entered room [%s].", message);
 			chatroom = strdup(message);
+			update_prompt();
 			break;
 		case LOGGED_IN:
 			g_string_assign(sender, "SERVER");
-			g_string_printf(output_message, "Successfully logged in as [%s].", message);
+			g_string_assign(output_message, "Successfully logged in.");
 			user = strdup(message);
+			update_prompt();
 			break;
 		case ROOM_MESSAGE:
-		case PRIVATE_MESSAGE:
+		case PRIVATE_MESSAGE_SENT:
+		case PRIVATE_MESSAGE_RECEIVED:
 			; // http://stackoverflow.com/questions/18496282/why-do-i-get-a-label-can-only-be-part-of-a-statement-and-a-declaration-is-not-a
 			gchar **msg = g_strsplit(message, " ", 2); // split into username and message
 			if (g_strv_length(msg) == 2) {
@@ -471,10 +565,13 @@ int connect_server(const char *hostname, const int port)
 }
 
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
 	errno = 0; // reset
 	int max_fd = 0;
+	prompt = g_string_new(NULL);
+	// just initializing the variable for buffering outcoming packets
+	packet = g_string_sized_new(MAX_PACKET_SIZE);
+	temp_string = g_string_sized_new(MAX_PACKET_SIZE);
 
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <address> <port>\n", argv[0]);
@@ -502,6 +599,7 @@ int main(int argc, char **argv)
 	/* Use the socket for the SSL connection. */
 	SSL_set_fd(ssl, socket_fd);
 
+	/* Set up secure connection to the chatd server. */
 	ERR_clear_error();
 	int ret = SSL_connect(ssl);
 	if (ret == 1) {
@@ -512,19 +610,9 @@ int main(int argc, char **argv)
 		clean_and_die(EXIT_FAILURE);
 	}
 
-	/* Now we can create BIOs and use them instead of the socket.
-	 * The BIO is responsible for maintaining the state of the
-	 * encrypted connection and the actual encryption. Reads and
-	 * writes to sock_fd will insert unencrypted data into the
-	 * stream, which even may crash the server.
-	 */
 
-	/* Set up secure connection to the chatd server. */
-
-	/* Read characters from the keyboard while waiting for input.
-	 */
-	prompt = strdup("> ");
-	rl_callback_handler_install(prompt, (rl_vcpfunc_t*) &readline_callback);
+	update_prompt();
+	rl_callback_handler_install(prompt->str, (rl_vcpfunc_t*) &readline_callback);
 	for (;;) {
 		fd_set rfds;
 		//struct timeval timeout;
