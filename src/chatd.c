@@ -283,8 +283,27 @@ bool user_member_of_chatroom(ClientConnection *client) {
 }
 
 
+void send_user_info(ClientConnection *connection, ClientConnection *recipient)
+{
+	g_string_printf(temp_string, "%-20s| %s : %-8d | %s",
+			connection->username->str,
+			inet_ntoa(connection->client_sockaddr.sin_addr),
+			ntohs(connection->client_sockaddr.sin_port),
+			connection->chatroom->str);
+	build_and_send_packet(connection, INFO, temp_string->str);
+}
+
+
 void send_list_of_all_users(ClientConnection *connection)
 {
+	//username, IP:port, chatroom
+	g_string_assign(temp_string, "USERNAME            |     IP    : PORT     | CHATROOM");
+	build_and_send_packet(connection, INFO, temp_string->str);
+	g_string_assign(temp_string, "---------------------------------------------------");
+	build_and_send_packet(connection, INFO, temp_string->str);
+
+	g_queue_foreach(clients_queue, (GFunc) send_user_info, connection);
+
 	return;
 }
 
@@ -300,7 +319,7 @@ void join_chat_room(ClientConnection *connection, const char *room)
 {
 	// TODO
 	if (user_logged_in(connection)) {
-		g_string_printf(temp_string, "joined room %s", room);
+		g_string_printf(temp_string, "joined room [%s]", room);
 		log_msg(connection, temp_string->str);
 		g_string_assign(connection->chatroom, room);
 		// TODO - change this for working authentication
@@ -311,7 +330,8 @@ void join_chat_room(ClientConnection *connection, const char *room)
 // NEED TO REWRITE
 void login_user(ClientConnection *connection, const char *username, const char *password)
 {
-	log_msg(connection, "authenticated");
+	g_string_printf(temp_string, "authenticated [%s]", username);
+	log_msg(connection, temp_string->str);
 	g_string_assign(connection->username, username);
 	// TODO - change this for working authentication
 	build_and_send_packet(connection, LOGGED_IN, username);

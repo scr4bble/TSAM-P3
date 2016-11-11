@@ -408,6 +408,7 @@ void readline_callback(char *line)
 	}
 	if (strncmp("/who", line, 4) == 0) {
 		/* Query all available users */
+		build_and_send_packet(WHO, "", 0);
 		return;
 	}
 	if (strncmp("/", line, 1) == 0) {
