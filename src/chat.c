@@ -335,12 +335,13 @@ void readline_callback(char *line)
 		return;
 	}
 	if (strncmp("/list", line, 5) == 0) {
-			/* Query all available chat rooms */
-			return;
+		/* Query all available chat rooms */
+		build_and_send_packet(LIST, "", 0);
+		return;
 	}
 	if (strncmp("/roll", line, 5) == 0) {
-			/* roll dice and declare winner. */
-			return;
+		/* roll dice and declare winner. */
+		return;
 	}
 	if (strncmp("/say", line, 4) == 0) {
 		/* Skip whitespace */

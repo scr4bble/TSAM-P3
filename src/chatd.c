@@ -251,7 +251,6 @@ int return_max_sockfd_in_queue(GQueue *clients_queue)
 }
 
 
-
 /* Check timer of the connection and close/destroy connection if time exceeded KEEP_ALIVE_TIMEOUT seconds */
 void check_timer(ClientConnection *connection)
 {
@@ -266,6 +265,7 @@ void check_timer(ClientConnection *connection)
 	}
 }
 
+// check if client is logged in - if not, send him error message
 bool user_logged_in(ClientConnection *client) {
 	if (client->username->len == 0) {
 		build_and_send_packet(client, ERROR, "You must log in first. Use '/user <username>'.");
@@ -274,15 +274,16 @@ bool user_logged_in(ClientConnection *client) {
 	return true;
 }
 
+// check if client is a member of any room -  if not, send him error message
 bool user_member_of_chatroom(ClientConnection *client) {
 	if (client->chatroom->len == 0) {
-		build_and_send_packet(client, ERROR, "You are not a member of any room. Use '/join <room>'");
+		build_and_send_packet(client, ERROR, "You are not a member of any room. Use '/join <room>' to join some room or to create new one.");
 		return false;
 	}
 	return true;
 }
 
-
+// send info about connection to requester (username, ip:port, room)
 void send_user_info(ClientConnection *connection, ClientConnection *recipient)
 {
 	g_string_printf(temp_string, "%-20s| %s : %-8d | %s",
@@ -290,39 +291,80 @@ void send_user_info(ClientConnection *connection, ClientConnection *recipient)
 			inet_ntoa(connection->client_sockaddr.sin_addr),
 			ntohs(connection->client_sockaddr.sin_port),
 			connection->chatroom->str);
-	build_and_send_packet(connection, INFO, temp_string->str);
+	build_and_send_packet(recipient, INFO, temp_string->str);
 }
 
-
+// send list of all connections (username, ip:port, room) to requester
 void send_list_of_all_users(ClientConnection *connection)
 {
-	//username, IP:port, chatroom
 	g_string_assign(temp_string, "USERNAME            |     IP    : PORT     | CHATROOM");
 	build_and_send_packet(connection, INFO, temp_string->str);
-	g_string_assign(temp_string, "---------------------------------------------------");
+	g_string_assign(temp_string, "-----------------------------------------------------");
 	build_and_send_packet(connection, INFO, temp_string->str);
 
 	g_queue_foreach(clients_queue, (GFunc) send_user_info, connection);
-
-	return;
 }
 
+// helper structure for passing more arguments into function called by foreach cycle
+typedef struct room_and_its_presence_in_queue
+{
+	GString *room;
+	bool room_already_in_queue;
+} RoomInQueue;
 
+
+// GFunc for foreach cycle - this function is called for every element in the queue
+void is_room_in_queue(GString *room_in_queue, RoomInQueue *new_room)
+{
+	if (g_string_equal(room_in_queue, new_room->room))
+		new_room->room_already_in_queue = true;
+}
+
+// add client (connection) room to the queue (if client is in some room and if room is not present in queue)
+void add_room_to_list(ClientConnection *connection, GQueue *room_queue)
+{
+	// if this connection is not member of any room, skip
+	if (connection->chatroom->len == 0)
+		return;
+
+	// just helper structure to pass two arguments into next foreach cycle
+	RoomInQueue new_room = {connection->chatroom, false};
+
+	// check room_queue if room is already there
+	g_queue_foreach(room_queue, (GFunc) is_room_in_queue, &new_room);
+
+	// add room into room_queue if it is not yet there
+	if (!new_room.room_already_in_queue)
+		g_queue_push_tail(room_queue, connection->chatroom);
+}
+
+// send list of all rooms to requester
 void send_list_of_all_rooms(ClientConnection *connection)
 {
-	return;
+
+	GQueue *room_queue = g_queue_new();
+	g_queue_foreach(clients_queue, (GFunc) add_room_to_list, room_queue);
+
+	g_string_assign(temp_string, "List of all rooms: ");
+	GString *room_p;
+	while ((room_p = g_queue_pop_head (room_queue)) != NULL) {
+		g_string_append(temp_string, room_p->str);
+		if (g_queue_peek_head(room_queue)) {
+			g_string_append(temp_string, ", ");
+		}
+	}
+	build_and_send_packet(connection, INFO, temp_string->str);
+	g_queue_free(room_queue);
 }
 
 
-// NEED TO REWRITE
+// assign connection (client) to the @room
 void join_chat_room(ClientConnection *connection, const char *room)
 {
-	// TODO
 	if (user_logged_in(connection)) {
 		g_string_printf(temp_string, "joined room [%s]", room);
 		log_msg(connection, temp_string->str);
 		g_string_assign(connection->chatroom, room);
-		// TODO - change this for working authentication
 		build_and_send_packet(connection, CHANGE_ROOM, room);
 	}
 }
@@ -346,18 +388,34 @@ void send_private_message(ClientConnection *sender, const char *recipient, const
 	return;
 }
 
+
+typedef struct
+{
+	GString *room;
+	GString *message;
+} RoomAndMessage;
+
+
+// send packet to client if he is in the room where message was sent
+void send_message_if_connection_in_chatroom(ClientConnection *connection, RoomAndMessage *room_and_message)
+{
+	if (g_string_equal(connection->chatroom, room_and_message->room))
+		build_and_send_packet(connection, ROOM_MESSAGE, room_and_message->message->str);
+}
+
+
 // send message to each client in the room where the client is (if any)
 void send_message(ClientConnection *sender, const char *message)
 {
-	if (user_logged_in(sender)) {
-		if (user_member_of_chatroom(sender)) {
-			// send packet to everybody in the chatroom
-			// TODO (delete this sending and rewrite it to foreach cycle through all client in the room)
+	if (user_logged_in(sender)) { // if user is logged in
+		if (user_member_of_chatroom(sender)) { // if user is a member of any chatroom
+			// build message string
 			g_string_printf(temp_string, "%s %s", sender->username->str, message);
-			build_and_send_packet(sender, ROOM_MESSAGE, temp_string->str);
+			RoomAndMessage room_and_message = {sender->chatroom, temp_string};
+			// send message to every client which is inside the room
+			g_queue_foreach(clients_queue, (GFunc) send_message_if_connection_in_chatroom, &room_and_message);
 		}
 	}
-	return;
 }
 
 
