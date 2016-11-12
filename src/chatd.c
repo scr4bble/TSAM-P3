@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h> // O_NONBLOCK flag
+#include <math.h> // floor()
 
 #include "chat_common.h"
 
@@ -66,7 +67,11 @@ typedef struct ClientConnection {
 	int num_of_tries;  // reminining number of tries to login
 	GString *chatroom;     // chat room
 	GString *username; // username after successful login
-	GString *game_oponent;
+
+	GString *challenger;
+	GString *challenged_user;
+	int random_number;
+	bool game_began;
 
 	SSL *ssl;
 	bool ssl_handshake_done;
@@ -75,7 +80,6 @@ typedef struct ClientConnection {
 	GTimer *login_timer;
 	struct sockaddr_in client_sockaddr;
 	GString *write_buffer;
-	GString *cookie_token;
 } ClientConnection;
 
 
@@ -106,14 +110,17 @@ ClientConnection* new_ClientConnection(int conn_fd)
 	connection->conn_timer = g_timer_new();
 
 	connection->login_timer = NULL;
+	connection->num_of_tries = 3;
 
-	connection->cookie_token = g_string_new(NULL);
 	connection->write_buffer = g_string_new(NULL);
 
 	connection->chatroom = g_string_new(NULL);
 	connection->username = g_string_new(NULL);
-	connection->game_oponent = g_string_new(NULL);
-	connection->num_of_tries = 3;
+
+	connection->challenger = g_string_new(NULL);
+	connection->challenged_user = g_string_new(NULL);
+	connection->random_number = 0;
+	connection->game_began = false;
 
 	connection->ssl_handshake_done = false;
 	connection->ssl = SSL_new(ssl_ctx);
@@ -139,11 +146,11 @@ void destroy_ClientConnection(ClientConnection *connection)
 	g_timer_destroy(connection->conn_timer); // destroy timer
 	if (connection->login_timer)
 		g_timer_destroy(connection->login_timer); // destroy timer
-	g_string_free(connection->cookie_token, TRUE);
 	g_string_free(connection->write_buffer, TRUE);
 	g_string_free(connection->chatroom, TRUE);
 	g_string_free(connection->username, TRUE);
-	g_string_free(connection->game_oponent, TRUE);
+	g_string_free(connection->challenger, TRUE);
+	g_string_free(connection->challenged_user, TRUE);
 	g_free(connection); // free memory allocated for this instance of ClientConnection
 }
 
@@ -428,6 +435,12 @@ void random_string(unsigned char *string, size_t length)
 	*string = '\0';
 }
 
+int random_number()
+{
+	srand48((unsigned int) time(0));
+	return (int) floor(drand48() * 6.0) + 1;
+}
+
 
 
 int authenticate(const char *username, const char *password)
@@ -547,27 +560,27 @@ void login_user(ClientConnection *connection, const char *username, const char *
 
 void send_private_message(ClientConnection *sender, const char *recipient, const char *message)
 {
-	if (user_logged_in(sender)) { // check if user is logged in
+	if (!user_logged_in(sender)) // check if user is logged in
+		return;
 
-		UsernameAndClient recipient_struct = {NULL, NULL};
-		recipient_struct.username = g_string_new(recipient);
-		// find recipient between connections
-		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &recipient_struct);
-		ClientConnection *recipient_connection = recipient_struct.client;
+	UsernameAndClient recipient_struct = {NULL, NULL};
+	recipient_struct.username = g_string_new(recipient);
+	// find recipient between connections
+	g_queue_foreach(clients_queue, (GFunc) username_to_connection, &recipient_struct);
+	ClientConnection *recipient_connection = recipient_struct.client;
 
-		if (recipient_connection) { // recipient does exist
-			// send message to sender back (confirm that it was delivered and show on the screen)
-			g_string_printf(temp_string, "%s %s", recipient_connection->username->str, message);
-			build_and_send_packet(sender, PRIVATE_MESSAGE_SENT, temp_string->str);
+	if (recipient_connection) { // recipient does exist
+		// send message to sender back (confirm that it was delivered and show on the screen)
+		g_string_printf(temp_string, "%s %s", recipient_connection->username->str, message);
+		build_and_send_packet(sender, PRIVATE_MESSAGE_SENT, temp_string->str);
 
-			// send message to recipient privately
-			g_string_printf(temp_string, "%s %s", sender->username->str, message);
-			build_and_send_packet(recipient_connection, PRIVATE_MESSAGE_RECEIVED, temp_string->str);
-		}
-		else { // recipient does not exist
-			g_string_printf(temp_string, "User [%s] does not exist or is currently not logged in.", recipient);
-			build_and_send_packet(sender, ERROR, temp_string->str);
-		}
+		// send message to recipient privately
+		g_string_printf(temp_string, "%s %s", sender->username->str, message);
+		build_and_send_packet(recipient_connection, PRIVATE_MESSAGE_RECEIVED, temp_string->str);
+	}
+	else { // recipient does not exist
+		g_string_printf(temp_string, "User [%s] does not exist or is currently not logged in.", recipient);
+		build_and_send_packet(sender, ERROR, temp_string->str);
 	}
 }
 
@@ -622,13 +635,16 @@ void game(ClientConnection *challenger, const char *challenged_user)
 	ClientConnection *challenged_client = username_and_client.client;
 
 	if (challenged_client) { // challenged client was found
-		if (challenged_client->game_oponent->len != 0) {
-			// user is currently in another challenge, cannot be challenged
+		if (challenged_client->challenger->len != 0 || challenged_client->challenged_user->len != 0) {
+			// user is currently in another challenge, cannot be challenged (either as challenger or challenged)
 			g_string_printf(temp_string, "User [%s] is currently in another challenge.", challenged_client->username->str);
 			build_and_send_packet(challenger, ERROR, temp_string->str);
 		}
 		else { // user can be challenged
-			g_string_assign(challenged_client->game_oponent, challenger->username->str);
+			// update link to challenger (inside challenged client structure)
+			g_string_assign(challenged_client->challenger, challenger->username->str);
+			// update link to challenged user (inside challenger client structure)
+			g_string_assign(challenger->challenged_user, challenged_client->username->str);
 
 			// send message to challenged client
 			build_and_send_packet(challenged_client, CHALLENGE, challenger->username->str);
@@ -650,9 +666,81 @@ void game(ClientConnection *challenger, const char *challenged_user)
 }
 
 
+void reset_game_attributes(ClientConnection *connection)
+{
+	connection->random_number = 0;
+	connection->game_began = false;
+	g_string_truncate(connection->challenger, 0);
+	g_string_truncate(connection->challenged_user, 0);
+}
+
+
 void roll(ClientConnection *connection)
 {
-	build_and_send_packet(connection, ERROR, "not yet implemented");
+	if (!user_logged_in(connection)) // check if user is logged in
+		return;
+
+	// GAME does not start yet or there is no challenge
+	if (!connection->game_began) {
+		build_and_send_packet(connection, ERROR, "You are not in any game or game have not started yet.");
+		return;
+	}
+
+	if (connection->random_number == 0) {
+		UsernameAndClient username_and_client = {NULL, NULL};
+		if (connection->challenger->len != 0) {
+			username_and_client.username = g_string_new(connection->challenger->str);
+		}
+		else { // connection->challenged_user
+			username_and_client.username = g_string_new(connection->challenged_user->str); // problem
+		}
+
+		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
+		ClientConnection *rival_connection = username_and_client.client;
+
+		if (!rival_connection) {
+			g_string_truncate(connection->challenger, 0);
+			g_string_truncate(connection->challenged_user, 0);
+			g_string_printf(temp_string, "User [%s] is not connected yet.", username_and_client.username->str);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+			return;
+		}
+
+		connection->random_number = random_number();
+		g_string_printf(temp_string, "User [%s] rolls %d (1-6).", connection->username->str, connection->random_number);
+		build_and_send_packet(connection, INFO, temp_string->str);
+		build_and_send_packet(rival_connection, INFO, temp_string->str);
+		if (rival_connection->random_number != 0) {
+			if (rival_connection->random_number > connection->random_number) {
+				g_string_printf(temp_string, "User [%s] won the game.", rival_connection->username->str);
+				build_and_send_packet(connection, INFO, temp_string->str);
+				build_and_send_packet(rival_connection, INFO, temp_string->str);
+				// RESET
+				reset_game_attributes(rival_connection);
+				reset_game_attributes(connection);
+			}
+			else if (rival_connection->random_number < connection->random_number) {
+				g_string_printf(temp_string, "User [%s] won the game. Congratulations.", connection->username->str);
+				build_and_send_packet(connection, INFO, temp_string->str);
+				build_and_send_packet(rival_connection, INFO, temp_string->str);
+				// RESET
+				reset_game_attributes(rival_connection);
+				reset_game_attributes(connection);
+
+			}
+			else {
+				g_string_assign(temp_string, "Draw. Use /roll again.");
+				rival_connection->random_number = 0;
+				connection->random_number = 0;
+				build_and_send_packet(connection, INFO, temp_string->str);
+				build_and_send_packet(rival_connection, INFO, temp_string->str);
+			}
+		}
+	}
+	else {
+		build_and_send_packet(connection, ERROR, "You have already rolled, wait for your rival.");
+		return;
+	}
 }
 
 
@@ -661,33 +749,35 @@ void accept_game(ClientConnection *connection)
 	if (!user_logged_in(connection)) // check if user is logged in
 		return;
 
-	if (connection->game_oponent->len == 0) {
+	if (connection->challenger->len == 0) { // if there is no link to challenger
 		// if client was not challenged, send him back error
 		build_and_send_packet(connection, ERROR, "You have not been challenged to any game.");
 	} else {
 		// client was challenged
-		UsernameAndClient username_and_client = {connection->game_oponent, NULL};
+		UsernameAndClient username_and_client = {connection->challenger, NULL};
 		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
-		ClientConnection *oponent = username_and_client.client;
+		ClientConnection *challenger = username_and_client.client;
 
-		if (oponent) { // challenger (oponent) is still connected
+		if (challenger) { // challenger is still connected
 
 			// send message to client that accepted the game
-			g_string_printf(temp_string, "You have accepted a game from [%s]. Use /roll to generate a number.", oponent->username->str);
+			g_string_printf(temp_string, "You have accepted a game from [%s]. Use /roll to generate a number.", challenger->username->str);
 			build_and_send_packet(connection, INFO, temp_string->str);
 
 			// send message to challenger
 			g_string_printf(temp_string, "User [%s] accepted your game. Use /roll to generate a number.", connection->username->str);
-			build_and_send_packet(oponent, INFO, temp_string->str);
+			build_and_send_packet(challenger, INFO, temp_string->str);
 
 			// log message
 			log_msg(connection, "accepted game");
+			connection->game_began = true;
+			challenger->game_began = true;
 		}
-		else { // challenger (oponent) was disconnected in the meantime
+		else { // challenger was disconnected in the meantime
 			// send message to client that tried to accept the game
-			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->game_oponent->str);
+			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->challenger->str);
 			build_and_send_packet(connection, ERROR, temp_string->str);
-			g_string_truncate(connection->game_oponent, 0);
+			g_string_truncate(connection->challenger, 0);
 		}
 	}
 }
@@ -698,34 +788,36 @@ void decline_game(ClientConnection *connection)
 	if (!user_logged_in(connection)) // check if user is logged in
 		return;
 
-	if (connection->game_oponent->len == 0) {
+	if (connection->challenger->len == 0) {
 		// if client was not challenged, send him back error
 		build_and_send_packet(connection, ERROR, "You have not been challenged to any game.");
 	} else {
 		// client was challenged
-		UsernameAndClient username_and_client = {connection->game_oponent, NULL};
+		UsernameAndClient username_and_client = {connection->challenger, NULL};
 		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
-		ClientConnection *oponent = username_and_client.client;
+		ClientConnection *challenger = username_and_client.client;
 
-		if (oponent) { // challenger (oponent) is still connected
+		if (challenger) { // challenger is still connected
 
 			// send message to client that declined the game
-			g_string_printf(temp_string, "You have declined a game from [%s].", oponent->username->str);
+			g_string_printf(temp_string, "You have declined a game from [%s].", challenger->username->str);
 			build_and_send_packet(connection, ERROR, temp_string->str);
 
 			// send message to challenger
 			g_string_printf(temp_string, "User [%s] declined your game.", connection->username->str);
-			build_and_send_packet(oponent, ERROR, temp_string->str);
+			build_and_send_packet(challenger, ERROR, temp_string->str);
 
 			// log message
 			log_msg(connection, "declined game");
-			g_string_truncate(connection->game_oponent, 0);
+			// update links (truncate usernames)
+			g_string_truncate(connection->challenger, 0);
+			g_string_truncate(challenger->challenged_user, 0);
 		}
-		else { // challenger (oponent) was disconnected in the meantime
+		else { // challenger was disconnected in the meantime
 			// send message to client that tried to decline the game
-			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->game_oponent->str);
+			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->challenger->str);
 			build_and_send_packet(connection, ERROR, temp_string->str);
-			g_string_truncate(connection->game_oponent, 0);
+			g_string_truncate(connection->challenger, 0);
 		}
 	}
 }

@@ -353,6 +353,7 @@ void readline_callback(char *line)
 	}
 	if (strncmp("/roll", line, 5) == 0) {
 		/* roll dice and declare winner. */
+		build_and_send_packet(ROLL, "", 0);
 		return;
 	}
 	if (strncmp("/say", line, 4) == 0) {
