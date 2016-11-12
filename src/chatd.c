@@ -1079,8 +1079,6 @@ int main(int argc, char **argv)
 	if (!load_keyfile())
 		return EXIT_FAILURE;
 
-	authenticate("jozko", "passwd");
-
 	errno = 0; // reset
 	packet = g_string_sized_new(MAX_PACKET_SIZE);
 	temp_string = g_string_sized_new(MAX_PACKET_SIZE);

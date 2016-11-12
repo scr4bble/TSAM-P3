@@ -323,6 +323,16 @@ void readline_callback(char *line)
 		build_and_send_packet(GAME, username, strlen(username));
 		return;
 	}
+	if (strncmp("/accept", line, 7) == 0) {
+		/* Accept game */
+		build_and_send_packet(ACCEPT, "", 0);
+		return;
+	}
+	if (strncmp("/decline", line, 8) == 0) {
+		/* Decline game */
+		build_and_send_packet(DECLINE, "", 0);
+		return;
+	}
 	if (strncmp("/join", line, 5) == 0) {
 		int i = 5;
 		/* Skip whitespace */
