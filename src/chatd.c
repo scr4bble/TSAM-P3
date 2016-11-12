@@ -547,7 +547,28 @@ void login_user(ClientConnection *connection, const char *username, const char *
 
 void send_private_message(ClientConnection *sender, const char *recipient, const char *message)
 {
-	return;
+	if (user_logged_in(sender)) { // check if user is logged in
+
+		UsernameAndClient recipient_struct = {NULL, NULL};
+		recipient_struct.username = g_string_new(recipient);
+		// find recipient between connections
+		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &recipient_struct);
+		ClientConnection *recipient_connection = recipient_struct.client;
+
+		if (recipient_connection) { // recipient does exist
+			// send message to sender back (confirm that it was delivered and show on the screen)
+			g_string_printf(temp_string, "%s %s", recipient_connection->username->str, message);
+			build_and_send_packet(sender, PRIVATE_MESSAGE_SENT, temp_string->str);
+
+			// send message to recipient privately
+			g_string_printf(temp_string, "%s %s", sender->username->str, message);
+			build_and_send_packet(recipient_connection, PRIVATE_MESSAGE_RECEIVED, temp_string->str);
+		}
+		else { // recipient does not exist
+			g_string_printf(temp_string, "User [%s] does not exist or is currently not logged in.", recipient);
+			build_and_send_packet(sender, ERROR, temp_string->str);
+		}
+	}
 }
 
 
@@ -631,7 +652,7 @@ void game(ClientConnection *challenger, const char *challenged_user)
 
 void roll(ClientConnection *connection)
 {
-	return;
+	build_and_send_packet(connection, ERROR, "not yet implemented");
 }
 
 

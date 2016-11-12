@@ -293,7 +293,6 @@ void clear_line()
    server messages in the loop in main(). */
 void readline_callback(char *line)
 {
-	char buffer[256];
 	if (NULL == line) {
 		rl_callback_handler_remove();
 		signal_handler(SIGTERM);
@@ -357,7 +356,7 @@ void readline_callback(char *line)
 		return;
 	}
 	if (strncmp("/say", line, 4) == 0) {
-		/* Skip whitespace */
+		/* Skip whitespaces and detect start of the username */
 		int i = 4;
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
@@ -367,8 +366,9 @@ void readline_callback(char *line)
 				rl_redisplay();
 				return;
 		}
-		/* Skip whitespace */
-		int j = i+1;
+		int j = i;
+
+		/* detect start of the message */
 		while (line[j] != '\0' && isgraph(line[j])) { j++; }
 		if (line[j] == '\0') {
 				write(STDOUT_FILENO, "Usage: /say username message\n",
@@ -377,11 +377,22 @@ void readline_callback(char *line)
 				rl_redisplay();
 				return;
 		}
-		char *receiver = strndup(&(line[i]), j - i - 1);
-		char *message = strndup(&(line[j]), j - i - 1);
+		char *receiver = strndup(&(line[i]), j - i);
+		/* Skip whitespaces */
+		while (line[j] != '\0' && isspace(line[j])) { j++; }
 
-		/* Send private message to receiver. */
+		char *message = &(line[j]);
 
+		/* Sent the message to the receiver splitted if necessary (MAX_MESSAGE_SIZE). */
+		for (int msg_len = strlen(message); msg_len > MAX_MESSAGE_SIZE; msg_len -= MAX_MESSAGE_SIZE) {
+			g_string_printf(temp_string, "%s %s", receiver, message);
+			build_and_send_packet(SAY, temp_string->str, MAX_MESSAGE_SIZE + 1 + strlen(receiver));
+			message += MAX_MESSAGE_SIZE;
+		}
+		g_string_printf(temp_string, "%s %s", receiver, message);
+		build_and_send_packet(SAY, temp_string->str, strlen(message) + 1 + strlen(receiver));
+
+		free(receiver);
 		return;
 	}
 	if (strncmp("/user", line, 5) == 0) {
@@ -502,7 +513,7 @@ bool process_server_message()
 				g_string_assign(output_message, msg[1]);
 			}
 			else
-				printf("Corrupted packet !!\n");
+				print_message(CLIENT_ERROR, "CLIENT", "Corrupted packet !!");
 			g_strfreev(msg);
 			break;
 		case CHALLENGE:
