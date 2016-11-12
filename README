@@ -1,4 +1,4 @@
-# Programming Assignment 3 
+# Programming Assignment 3
 – SSL Chat system
 /*
  * Team:
@@ -6,21 +6,27 @@
  * Óskar Örn <oskart10@ru.is>
  * Peter Hostačný <peterh16@ru.is>
  */
- 
+
  The purpose of this project is to create a Chat System, using a Secure Socket Layer protocol.
- 
+
  Protocol Design:
- 
+
  We will be using OpenSSL library for any actual SSL implementation and encryption.
  The Chat System will use a Client/Server architecture. Messages will be passed, using ASCII text format, where the maximum size of messages is 1000 bytes.
 
  6.2. Answers:
  The passwords are stored on the server side, in a hashed form.
- Passwords are stored at... and the salt strings are stored at... 
- Clients will send their password over to the server in a plain text format, because the transmission will be encrytped, 
+ Passwords are stored at... and the salt strings are stored at...
+ Clients will send their password over to the server in a plain text format, because the transmission will be encrytped,
  thus nobody can read the password in transit.
 
- 
+
+possible attacks:
+- generate thousands of users (this could be prevented by solid database of users and allow users to create new "accounts" by another interface ... using captcha + mail verification)
+- spam server by sending too many requests (for example spamming /who) - could be prevented by disabling this command for not authenticated users or put there some limitation - for example, min. 5 seconds delay from last query or disconnect user after spamming detected (by spamming is meant command spamming)
+- spamming in the room - could be prevented limiting users - max. of 5 messages in 5 seconds and detection
+
+
 - generating private key (-aes128 option for key encrypted by passphrase)
 openssl genrsa -out server.key 2048
 

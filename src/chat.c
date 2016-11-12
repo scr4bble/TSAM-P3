@@ -209,7 +209,7 @@ void build_and_send_packet(int opcode, const char *message, int len)
 }
 
 // Username can contain only \"A-Za-z0-9._-|\" and must be max. MAX_USERNAME_LENGTH characters long.
-bool check_username(char *username)
+bool check_username(const char *username)
 {
 	int username_length = strlen(username);
 
@@ -241,6 +241,7 @@ void print_message(int msg_type, char *sender, char *message)
 		case INFO:
 		case CHANGE_ROOM:
 		case LOGGED_IN:
+		case USER_CREATED:
 			color = ANSI_COLOR_GREEN;
 			break;
 		case ROOM_MESSAGE:
@@ -308,7 +309,7 @@ void readline_callback(char *line)
 	}
 	if (strncmp("/game", line, 5) == 0) {
 		/* Skip whitespace */
-		int i = 4;
+		int i = 5;
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
 			write(STDOUT_FILENO, "Usage: /game username\n",
@@ -318,6 +319,8 @@ void readline_callback(char *line)
 			return;
 		}
 		/* Start game */
+		const char *username = &(line[i]);
+		build_and_send_packet(GAME, username, strlen(username));
 		return;
 	}
 	if (strncmp("/join", line, 5) == 0) {
@@ -381,7 +384,7 @@ void readline_callback(char *line)
 				rl_redisplay();
 				return;
 		}
-		char *new_user = &(line[i]);
+		const char *new_user = &(line[i]);
 		if (!check_username(new_user)) {
 			char error_message[512];
 			sprintf(error_message, "Username can contain only \"A-Za-z0-9._-|\" and must be max. %d characters long.", MAX_USERNAME_LENGTH);
@@ -414,7 +417,7 @@ void readline_callback(char *line)
 	}
 	if (strncmp("/", line, 1) == 0) {
 		print_message(CLIENT_ERROR, "CLIENT", "Unknown command.");
-		rl_redisplay();
+		clear_line();
 		return;
 	}
 	/* Sent the buffer to the server. */
@@ -473,6 +476,12 @@ bool process_server_message()
 			user = strdup(message);
 			update_prompt();
 			break;
+		case USER_CREATED:
+			g_string_assign(sender, "SERVER");
+			g_string_assign(output_message, "Successfully logged in (new user created).");
+			user = strdup(message);
+			update_prompt();
+			break;
 		case ROOM_MESSAGE:
 		case PRIVATE_MESSAGE_SENT:
 		case PRIVATE_MESSAGE_RECEIVED:
@@ -487,7 +496,8 @@ bool process_server_message()
 			g_strfreev(msg);
 			break;
 		case CHALLENGE:
-			g_string_printf(output_message, "You are challenged to Game of Fortune by [%s]. Use /accept or /decline to answer.", message);
+			g_string_assign(sender, "SERVER");
+			g_string_printf(output_message, "You have been challenged to Game of Fortune by user [%s]. Use /accept or /decline to answer.", message);
 			break;
 	}
 	print_message(opcode, sender->str, output_message->str);

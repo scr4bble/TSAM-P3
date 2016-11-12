@@ -32,8 +32,17 @@
 #define KEEP_ALIVE_TIMEOUT 30
 
 
+#define _AUTHENTICATED  0
+#define _USER_CREATED   1
+#define _AUTH_FAILED    2
+
+
 #define SERVER_CERT_FILE "server.crt"
 #define SERVER_KEY_FILE "server.key"
+
+
+#define PASSWORDS_KEYFILE "passwords.ini"
+static GKeyFile *keyfile;
 
 
 // welcome message
@@ -44,12 +53,11 @@ static const char WELCOME_MSG[] = "Welcome";
 static GString *packet;
 static GString *temp_string;
 
+
 static SSL_CTX *ssl_ctx; // encryption for sockets
 static int sockfd; // master socket (server listening socket)
 static GQueue *clients_queue;
 static GQueue *clients_write_queue;
-//static GHashTable* cookies;
-
 
 
 
@@ -58,12 +66,13 @@ typedef struct ClientConnection {
 	int num_of_tries;  // reminining number of tries to login
 	GString *chatroom;     // chat room
 	GString *username; // username after successful login
-	// GString *game_oponent;
+	GString *game_oponent;
 
 	SSL *ssl;
 	bool ssl_handshake_done;
 	int conn_fd;
 	GTimer *conn_timer;
+	GTimer *login_timer;
 	struct sockaddr_in client_sockaddr;
 	GString *write_buffer;
 	GString *cookie_token;
@@ -95,11 +104,15 @@ ClientConnection* new_ClientConnection(int conn_fd)
 
 	connection->conn_fd = conn_fd;
 	connection->conn_timer = g_timer_new();
+
+	connection->login_timer = NULL;
+
 	connection->cookie_token = g_string_new(NULL);
 	connection->write_buffer = g_string_new(NULL);
 
 	connection->chatroom = g_string_new(NULL);
 	connection->username = g_string_new(NULL);
+	connection->game_oponent = g_string_new(NULL);
 	connection->num_of_tries = 3;
 
 	connection->ssl_handshake_done = false;
@@ -124,10 +137,13 @@ void destroy_ClientConnection(ClientConnection *connection)
 	SSL_free(connection->ssl);
 	close(connection->conn_fd); // close socket with client connection
 	g_timer_destroy(connection->conn_timer); // destroy timer
+	if (connection->login_timer)
+		g_timer_destroy(connection->login_timer); // destroy timer
 	g_string_free(connection->cookie_token, TRUE);
 	g_string_free(connection->write_buffer, TRUE);
 	g_string_free(connection->chatroom, TRUE);
 	g_string_free(connection->username, TRUE);
+	g_string_free(connection->game_oponent, TRUE);
 	g_free(connection); // free memory allocated for this instance of ClientConnection
 }
 
@@ -172,7 +188,20 @@ void clean_and_die(int exit_code)
 	g_string_free(packet, TRUE);
 	g_string_free(temp_string, TRUE);
 
-	//g_hash_table_destroy(cookies);
+	// save passwords into file
+	gsize length;
+	gchar *keyfile_string = g_key_file_to_data(keyfile, &length, NULL);
+
+	FILE * passwd_file;
+	if ((passwd_file = fopen(PASSWORDS_KEYFILE, "w")) != NULL) {
+		fwrite (keyfile_string , sizeof(gchar), length, passwd_file);
+		fclose(passwd_file);
+	}
+	else {
+		fprintf(stderr, "Problem occured while trying to save password database into %s.\n", PASSWORDS_KEYFILE);
+	}
+	g_free(keyfile_string);
+	g_key_file_free(keyfile);
 
 	exit(exit_code);
 }
@@ -341,7 +370,6 @@ void add_room_to_list(ClientConnection *connection, GQueue *room_queue)
 // send list of all rooms to requester
 void send_list_of_all_rooms(ClientConnection *connection)
 {
-
 	GQueue *room_queue = g_queue_new();
 	g_queue_foreach(clients_queue, (GFunc) add_room_to_list, room_queue);
 
@@ -361,7 +389,7 @@ void send_list_of_all_rooms(ClientConnection *connection)
 // assign connection (client) to the @room
 void join_chat_room(ClientConnection *connection, const char *room)
 {
-	if (user_logged_in(connection)) {
+	if (user_logged_in(connection)) { // check if user is logged in
 		g_string_printf(temp_string, "joined room [%s]", room);
 		log_msg(connection, temp_string->str);
 		g_string_assign(connection->chatroom, room);
@@ -369,17 +397,151 @@ void join_chat_room(ClientConnection *connection, const char *room)
 	}
 }
 
-// NEED TO REWRITE
+typedef struct
+{
+	GString *username;
+	ClientConnection *client;
+} UsernameAndClient;
+
+void username_to_connection(ClientConnection *connection, UsernameAndClient *wanted)
+{
+	if (g_string_equal(connection->username, wanted->username)) {
+		wanted->client = connection;
+	}
+}
+
+
+/*  Random string generator */
+void random_string(unsigned char *string, size_t length)
+{
+	static char charset[] = "0123456789"
+				"abcdefghijklmnopqrstuvwxyz"
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+	/* Seed number for rand() */
+	srand((unsigned int) time(0));
+
+	while (length-- > 0) {
+		size_t index = (double) rand() / RAND_MAX * (sizeof charset - 1);
+		*string++ = charset[index];
+	}
+	*string = '\0';
+}
+
+
+
+int authenticate(const char *username, const char *password)
+{
+	gchar *hash_passwd64_from_db, *hash_salt64_from_db;
+	gsize length;
+
+	hash_passwd64_from_db = g_key_file_get_string(keyfile, "passwords", username, NULL);
+	hash_salt64_from_db = g_key_file_get_string(keyfile, "salts", username, NULL);
+
+	unsigned char salt[MAX_PASSWORD_LENGTH];
+	if (hash_salt64_from_db) { // user was found in database
+		// loading salt from file
+		guchar *hash_salt_from_db = g_base64_decode(hash_salt64_from_db, &length); // salt was base64 coded - decode it
+		strncpy((char*)salt, (char*)hash_salt_from_db, sizeof(salt)); // copy decoded string from db to local variable
+		g_free(hash_salt_from_db); // deallocating result of decode function
+		if (length != MAX_PASSWORD_LENGTH) // if nobody touched the file, sizes should equal
+			fprintf(stderr, "ERR: salt length after decoding != MAX_PASSWORD_LENGTH.\n");
+		if (!hash_passwd64_from_db)
+			fprintf(stderr, "ERR: hash found in file, but password not. '%s' is inconsistent.\n", PASSWORDS_KEYFILE);
+	}
+	else
+		random_string(salt, MAX_PASSWORD_LENGTH);
+
+	unsigned char hash_passwd[SIZE_OF_HASH];
+	if(!PKCS5_PBKDF2_HMAC_SHA1(password, strlen(password), salt, sizeof(salt), HASH_ITERATION, sizeof(hash_passwd), hash_passwd) != 0 ) {
+		// ERROR
+		fprintf(stderr, "ERR: PKCS5_PBKDF2_HMAC_SHA1 failed, something is wrong. Please investigate.\n");
+		return _AUTH_FAILED;
+	}
+	gchar *hash_passwd64_new = g_base64_encode(hash_passwd, sizeof(hash_passwd));
+
+	if (hash_passwd64_from_db) { // if user was found in database
+		// compare hashes
+		if (strcmp(hash_passwd64_from_db, hash_passwd64_new) == 0) {
+			// password match
+			return _AUTHENTICATED;
+		}
+		else { // passwords differ
+			return _AUTH_FAILED;
+		}
+	}
+	else { // user was not found in database, create new user
+		gchar *hash_salt64_new = g_base64_encode(salt, sizeof(salt));
+		g_key_file_set_string(keyfile, "passwords", username, hash_passwd64_new);
+		g_key_file_set_string(keyfile, "salts", username, hash_salt64_new);
+		g_free(hash_salt64_new);
+	}
+
+	g_free(hash_passwd64_from_db);
+	g_free(hash_salt64_from_db);
+	g_free(hash_passwd64_new);
+
+	return _USER_CREATED;
+}
+
+
 void login_user(ClientConnection *connection, const char *username, const char *password)
 {
-	g_string_printf(temp_string, "authenticated [%s]", username);
-	log_msg(connection, temp_string->str);
-	g_string_assign(connection->username, username);
-	// TODO - change this for working authentication
-	build_and_send_packet(connection, LOGGED_IN, username);
-	//#define WRONG_PASSWORD_MSG "Authentication failed (wrong password). Remaining tries: %d."
-	//#define WRONG_USERNAME_MSG "Authentication failed (wrong username). Remaining tries: %d."
-	return;
+	UsernameAndClient username_and_client = {NULL, NULL};
+	username_and_client.username = g_string_new(username);
+
+	g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
+	ClientConnection *logged_client = username_and_client.client;
+
+	if (logged_client) {
+		g_string_printf(temp_string, "User [%s] is already logged in. Contact administrator of chat services in case you want to kick him out.", username);
+		build_and_send_packet(connection, ERROR, temp_string->str);
+		return;
+	}
+
+	if (connection->login_timer) { // if timer was created
+		gdouble seconds_elapsed_from_last_failed_login = g_timer_elapsed(connection->login_timer, NULL);
+		if (seconds_elapsed_from_last_failed_login < 5) {
+			g_string_printf(temp_string, "You have to wait %d seconds and then you can try to log in again.", (int) seconds_elapsed_from_last_failed_login);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+			return;
+		}
+	}
+
+	// try to authenticate
+	switch(authenticate(username, password)) {
+		case _AUTHENTICATED:
+			g_string_assign(connection->username, username);
+			build_and_send_packet(connection, LOGGED_IN, username);
+
+			g_string_printf(temp_string, "authenticated [%s]", username);
+			log_msg(connection, temp_string->str);
+			connection->num_of_tries = 3; // reset counter for attempts to login
+			break;
+		case _AUTH_FAILED: // authentication failed
+			log_msg(connection, "authentication error");
+
+			if ((--connection->num_of_tries) == 0) {
+				build_and_send_packet(connection, ERROR, "Maximum number of login attempts reached. You will be disconnected!");
+				remove_ClientConnection(connection);
+				return;
+			}
+			g_string_printf(temp_string, "Authentication failed (wrong password). Remaining tries: %d.", connection->num_of_tries);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+			if (connection->login_timer == NULL)
+				connection->login_timer = g_timer_new();
+			else
+				g_timer_start(connection->login_timer); // reset timer
+			break;
+		case _USER_CREATED:
+			g_string_assign(connection->username, username);
+			build_and_send_packet(connection, USER_CREATED, username);
+
+			g_string_printf(temp_string, "authenticated [%s] (new user created)", username);
+			log_msg(connection, temp_string->str);
+			connection->num_of_tries = 3; // reset counter for attempts to login
+			break;
+	}
 }
 
 
@@ -407,8 +569,8 @@ void send_message_if_connection_in_chatroom(ClientConnection *connection, RoomAn
 // send message to each client in the room where the client is (if any)
 void send_message(ClientConnection *sender, const char *message)
 {
-	if (user_logged_in(sender)) { // if user is logged in
-		if (user_member_of_chatroom(sender)) { // if user is a member of any chatroom
+	if (user_logged_in(sender)) { // check if user is logged in
+		if (user_member_of_chatroom(sender)) { // check if user is a member of any chatroom
 			// build message string
 			g_string_printf(temp_string, "%s %s", sender->username->str, message);
 			RoomAndMessage room_and_message = {sender->chatroom, temp_string};
@@ -419,9 +581,51 @@ void send_message(ClientConnection *sender, const char *message)
 }
 
 
+
+
+
 void game(ClientConnection *challenger, const char *challenged_user)
 {
-	return;
+	if (!user_logged_in(challenger)) // check if user is logged in
+		return;
+
+	if (strcmp(challenger->username->str, challenged_user) == 0) {
+		build_and_send_packet(challenger, ERROR, "You cannot challenge yourself.");
+		return;
+	}
+
+	UsernameAndClient username_and_client = {NULL, NULL};
+	username_and_client.username = g_string_new(challenged_user);
+
+	g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
+	ClientConnection *challenged_client = username_and_client.client;
+
+	if (challenged_client) { // challenged client was found
+		if (challenged_client->game_oponent->len != 0) {
+			// user is currently in another challenge, cannot be challenged
+			g_string_printf(temp_string, "User [%s] is currently in another challenge.", challenged_client->username->str);
+			build_and_send_packet(challenger, ERROR, temp_string->str);
+		}
+		else { // user can be challenged
+			g_string_assign(challenged_client->game_oponent, challenger->username->str);
+
+			// send message to challenged client
+			build_and_send_packet(challenged_client, CHALLENGE, challenger->username->str);
+
+			// send message to challenger
+			g_string_printf(temp_string, "User [%s] was challengd. Waiting for acceptance.", challenged_client->username->str);
+			build_and_send_packet(challenger, INFO, temp_string->str);
+
+			// log message
+			g_string_printf(temp_string, "challenge sent to [%s]", challenged_client->username->str);
+			log_msg(challenger, temp_string->str);
+		}
+	}
+	else { // challenged user was not found
+		g_string_printf(temp_string, "User [%s] was not found.", challenged_user);
+		build_and_send_packet(challenger, ERROR, temp_string->str);
+	}
+	g_string_free(username_and_client.username, TRUE);
 }
 
 
@@ -433,13 +637,76 @@ void roll(ClientConnection *connection)
 
 void accept_game(ClientConnection *connection)
 {
-	return;
+	if (!user_logged_in(connection)) // check if user is logged in
+		return;
+
+	if (connection->game_oponent->len == 0) {
+		// if client was not challenged, send him back error
+		build_and_send_packet(connection, ERROR, "You have not been challenged to any game.");
+	} else {
+		// client was challenged
+		UsernameAndClient username_and_client = {connection->game_oponent, NULL};
+		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
+		ClientConnection *oponent = username_and_client.client;
+
+		if (oponent) { // challenger (oponent) is still connected
+
+			// send message to client that accepted the game
+			g_string_printf(temp_string, "You have accepted a game from [%s]. Use /roll to generate a number.", oponent->username->str);
+			build_and_send_packet(connection, INFO, temp_string->str);
+
+			// send message to challenger
+			g_string_printf(temp_string, "User [%s] accepted your game. Use /roll to generate a number.", connection->username->str);
+			build_and_send_packet(oponent, INFO, temp_string->str);
+
+			// log message
+			log_msg(connection, "accepted game");
+		}
+		else { // challenger (oponent) was disconnected in the meantime
+			// send message to client that tried to accept the game
+			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->game_oponent->str);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+			g_string_truncate(connection->game_oponent, 0);
+		}
+	}
 }
 
 
 void decline_game(ClientConnection *connection)
 {
-	return;
+	if (!user_logged_in(connection)) // check if user is logged in
+		return;
+
+	if (connection->game_oponent->len == 0) {
+		// if client was not challenged, send him back error
+		build_and_send_packet(connection, ERROR, "You have not been challenged to any game.");
+	} else {
+		// client was challenged
+		UsernameAndClient username_and_client = {connection->game_oponent, NULL};
+		g_queue_foreach(clients_queue, (GFunc) username_to_connection, &username_and_client);
+		ClientConnection *oponent = username_and_client.client;
+
+		if (oponent) { // challenger (oponent) is still connected
+
+			// send message to client that declined the game
+			g_string_printf(temp_string, "You have declined a game from [%s].", oponent->username->str);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+
+			// send message to challenger
+			g_string_printf(temp_string, "User [%s] declined your game.", connection->username->str);
+			build_and_send_packet(oponent, ERROR, temp_string->str);
+
+			// log message
+			log_msg(connection, "declined game");
+			g_string_truncate(connection->game_oponent, 0);
+		}
+		else { // challenger (oponent) was disconnected in the meantime
+			// send message to client that tried to decline the game
+			g_string_printf(temp_string, "User [%s] is not connected yet.", connection->game_oponent->str);
+			build_and_send_packet(connection, ERROR, temp_string->str);
+			g_string_truncate(connection->game_oponent, 0);
+		}
+	}
 }
 
 
@@ -777,8 +1044,43 @@ bool start_listening(int server_port)
 }
 
 
+bool file_exists(const char * filename)
+{
+	FILE * file;
+	if ((file = fopen(filename, "r")) != NULL) {
+		fclose(file);
+		return true;
+	}
+	return false;
+}
+
+
+bool load_keyfile()
+{
+	keyfile = g_key_file_new();
+
+	if (file_exists(PASSWORDS_KEYFILE)) {
+		GError *error;
+		if (!g_key_file_load_from_file(keyfile, PASSWORDS_KEYFILE, G_KEY_FILE_KEEP_COMMENTS | G_KEY_FILE_KEEP_TRANSLATIONS, &error)) {
+			g_debug("%s", error->message);
+			printf("Keyfile '%s' is corrupted.\n", PASSWORDS_KEYFILE);
+			return false;
+		}
+	}
+	return true;
+}
+
+
+
+
 int main(int argc, char **argv)
 {
+
+	if (!load_keyfile())
+		return EXIT_FAILURE;
+
+	authenticate("jozko", "passwd");
+
 	errno = 0; // reset
 	packet = g_string_sized_new(MAX_PACKET_SIZE);
 	temp_string = g_string_sized_new(MAX_PACKET_SIZE);

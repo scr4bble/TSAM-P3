@@ -13,6 +13,8 @@
 #define MAX_IDLE_TIME 180 // in seconds
 #define MAX_USERNAME_LENGTH 32 // characters
 #define MAX_PASSWORD_LENGTH 32 // characters
+#define HASH_ITERATION 10000 // number of iterations of PKCS5_PBKDF2_HMAC_SHA1() for passwords
+#define SIZE_OF_HASH 128 // number of iterations of PKCS5_PBKDF2_HMAC_SHA1() for passwords
 
 
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -61,6 +63,7 @@ typedef enum {
 	INFO,             // for example "Welcome message"
 	CHANGE_ROOM,      // after receiving this message client can set up internal variable with room
 	LOGGED_IN,        // after receiving this message client can set up internal variable with username
+	USER_CREATED,     // after receiving this message client can set up internal variable with username
 	ROOM_MESSAGE,     // just print out room message "<OPCODE><USERNAME> <MESSAGE>"
 	PRIVATE_MESSAGE_SENT,      // private message "<OPCODE><USERNAME> <MESSAGE>"
 	PRIVATE_MESSAGE_RECEIVED,  // private message "<OPCODE><USERNAME> <MESSAGE>"
