@@ -18,22 +18,8 @@
  Our chat application is implemented as a client/server architecture.
  Designed protocol is very simple - packets consist only of opcode (4 bytes)
  and data. Opcode is stored in binary form inside packet. Data are created by
- user and thus it will be probably ASCII sequence of characters but since we
- didn't want to rely on such an assumption we implemented it in the way it can
- handle also binary data.
-
- We use non-blocking sockets for client connections so no client can block
- the server by stucking at SSL handshake or by any message.
-
- Server uses select() and complicated internal structure for handling multiple
- connections. Connections are stored inside double-ended queue (glibc).
-
- Certificate is self-signed but until we can distribute it to all clients
- in a secure way, it provides the same level of security as CA-signed
- certificates do.
-
- Maximal size of one packet is specified in chat_common.h:
-    #define MAX_PACKET_SIZE 1200
+ user and thus it will be probably ASCII sequence of characters but server must
+ be able to handle also binary data.
 
  Detailed description of possible opcodes is bellow. All opcodes are listed
  inside enumeration types in chat_common.h.
@@ -154,6 +140,9 @@ Commands /bye and /quit just close the connection. No packet is sent to server.
 
 ================================================================================
 
+                         =======================
+                         ||      Answers      ||
+                         =======================
 
 6.2. Answers:
 
@@ -214,18 +203,27 @@ Commands /bye and /quit just close the connection. No packet is sent to server.
 
 ================================================================================
 
+                         ========================
+                         ||   IMPLEMENTATION   ||
+                         ========================
 
-CHAT CLIENT RESTRICTIONS:
+ Data inside packets are probably ASCII text but since should be able to handle
+ also binary data and we didn't want to rely on such an assumption
+ we implemented it in the way it can process almost any packet (with few
+ restrictions preventing clients from trying to break the server).
 
-    - Chat client will split message into more messages if it exceed
-      MAX_MESSAGE_SIZE (chat_common.h)
-    - User is forced to use only these characters in username: "A-Za-z0-9._-|"
+ We use non-blocking sockets for client connections so no client can block
+ the server by stucking at SSL handshake or by any message.
 
-    - Maximal length of username is MAX_USERNAME_LENGTH (chat_common.h)
-      Maximal length of password is MAX_PASSWORD_LENGTH (chat_common.h)
-      (server uses dynamic data structures for these strings and
-      MAX_PACKET_SIZE so he doesn't have to care about security of this and
-      it is just up to client implementation)
+ Server uses select() and complicated internal structure for handling multiple
+ connections. Connections are stored inside double-ended queue (glibc).
+
+ Certificate is self-signed but until we can distribute it to all clients
+ in a secure way, it provides the same level of security as CA-signed
+ certificates do.
+
+ Maximal size of one packet is specified in chat_common.h:
+    #define MAX_PACKET_SIZE 1200
 
 
 SERVER RESTRICTIONS:
@@ -241,8 +239,21 @@ SERVER RESTRICTIONS:
         - client haven't sent any packet for MAX_IDLE_TIME (chat_common.h)
 
 
-SERVER interesting functions:
-    - clean_and_die() // frees memory and ends the application
+CHAT CLIENT RESTRICTIONS:
+
+    - Chat client will split message into more messages if it exceed
+      MAX_MESSAGE_SIZE (chat_common.h)
+    - User is forced to use only these characters in username: "A-Za-z0-9._-|"
+
+    - Maximal length of username is MAX_USERNAME_LENGTH (chat_common.h)
+      Maximal length of password is MAX_PASSWORD_LENGTH (chat_common.h)
+      (server uses dynamic data structures for these strings and
+      MAX_PACKET_SIZE so he doesn't have to care about security of this and
+      it is just up to client implementation)
+
+
+Interesting functions in chat.c:
+    - clean_and_die()  // frees memory and ends the application
     - log_msg() // takes care of all server's logging (printed to output)
     - send_packet() // takes care of transmitting all outgoing packets
             If packet was not successfully transmitted, it is added into
@@ -251,6 +262,19 @@ SERVER interesting functions:
     - initialize_openssl() // initialize openssl structures and loads keys
     - run_loop() // server loop for serving clients
     - parse_client_message() // parse packet received from a client
+    - build_and_send_packet() // build packet from opcode and message + send it
+
+Interesting functions in chatd.c:
+    - clean_and_die()  // frees memory and ends the application
+    - build_and_send_packet() // build packet from opcode and message + send it
+    - print_message()  // print message from server in nice format
+                          (colored, with timestamp)
+    - readline_callback()  // function callback for handling user's input
+    - process_server_message()  // read packet from socket and process it
+    - initialize_openssl() // initialize openssl structures and loads CA-cert
+
+Interesting functions in chat_common.c:
+    - recv_packet() // read packet from SSL connection and store into GString
 
 
 ================================================================================
