@@ -29,10 +29,6 @@
 	#define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
-// default keep-alive timeout for clients
-#define KEEP_ALIVE_TIMEOUT 30
-
-
 #define _AUTHENTICATED  0
 #define _USER_CREATED   1
 #define _AUTH_FAILED    2
@@ -110,7 +106,7 @@ ClientConnection* new_ClientConnection(int conn_fd)
 	connection->conn_timer = g_timer_new();
 
 	connection->login_timer = NULL;
-	connection->num_of_tries = 3;
+	connection->num_of_tries = MAX_FAILED_PASSWD_TRIES;
 
 	connection->write_buffer = g_string_new(NULL);
 
@@ -182,6 +178,8 @@ void clean_and_die(int exit_code)
 	close(sockfd);
 	SSL_CTX_free(ssl_ctx);
 	EVP_cleanup();
+	ERR_free_strings();
+	ERR_remove_state(0);
 
 	//fclose(log_file);
 
@@ -287,7 +285,7 @@ int return_max_sockfd_in_queue(GQueue *clients_queue)
 }
 
 
-/* Check timer of the connection and close/destroy connection if time exceeded KEEP_ALIVE_TIMEOUT seconds */
+/* Check timer of the connection and close/destroy connection if time exceeded MAX_IDLE_TIME seconds */
 void check_timer(ClientConnection *connection)
 {
 
@@ -451,19 +449,19 @@ int authenticate(const char *username, const char *password)
 	hash_passwd64_from_db = g_key_file_get_string(keyfile, "passwords", username, NULL);
 	hash_salt64_from_db = g_key_file_get_string(keyfile, "salts", username, NULL);
 
-	unsigned char salt[MAX_PASSWORD_LENGTH];
+	unsigned char salt[SALT_LENGTH];
 	if (hash_salt64_from_db) { // user was found in database
 		// loading salt from file
 		guchar *hash_salt_from_db = g_base64_decode(hash_salt64_from_db, &length); // salt was base64 coded - decode it
 		strncpy((char*)salt, (char*)hash_salt_from_db, sizeof(salt)); // copy decoded string from db to local variable
 		g_free(hash_salt_from_db); // deallocating result of decode function
-		if (length != MAX_PASSWORD_LENGTH) // if nobody touched the file, sizes should equal
-			fprintf(stderr, "ERR: salt length after decoding != MAX_PASSWORD_LENGTH.\n");
+		if (length != SALT_LENGTH) // if nobody touched the file, sizes should equal
+			fprintf(stderr, "ERR: salt length after decoding != SALT_LENGTH defined constant.\n");
 		if (!hash_passwd64_from_db)
 			fprintf(stderr, "ERR: hash found in file, but password not. '%s' is inconsistent.\n", PASSWORDS_KEYFILE);
 	}
 	else
-		random_string(salt, MAX_PASSWORD_LENGTH);
+		random_string(salt, SALT_LENGTH);
 
 	unsigned char hash_passwd[SIZE_OF_HASH];
 	if(!PKCS5_PBKDF2_HMAC_SHA1(password, strlen(password), salt, sizeof(salt), HASH_ITERATION, sizeof(hash_passwd), hash_passwd) != 0 ) {
@@ -514,7 +512,7 @@ void login_user(ClientConnection *connection, const char *username, const char *
 
 	if (connection->login_timer) { // if timer was created
 		gdouble seconds_elapsed_from_last_failed_login = g_timer_elapsed(connection->login_timer, NULL);
-		if (seconds_elapsed_from_last_failed_login < 5) {
+		if (seconds_elapsed_from_last_failed_login < FAILED_LOGIN_DELAY_TIME) {
 			g_string_printf(temp_string, "You have to wait %d seconds and then you can try to log in again.", (int) seconds_elapsed_from_last_failed_login);
 			build_and_send_packet(connection, ERROR, temp_string->str);
 			return;
@@ -529,7 +527,7 @@ void login_user(ClientConnection *connection, const char *username, const char *
 
 			g_string_printf(temp_string, "authenticated [%s]", username);
 			log_msg(connection, temp_string->str);
-			connection->num_of_tries = 3; // reset counter for attempts to login
+			connection->num_of_tries = MAX_FAILED_PASSWD_TRIES; // reset counter for attempts to login
 			break;
 		case _AUTH_FAILED: // authentication failed
 			log_msg(connection, "authentication error");
@@ -552,7 +550,7 @@ void login_user(ClientConnection *connection, const char *username, const char *
 
 			g_string_printf(temp_string, "authenticated [%s] (new user created)", username);
 			log_msg(connection, temp_string->str);
-			connection->num_of_tries = 3; // reset counter for attempts to login
+			connection->num_of_tries = MAX_FAILED_PASSWD_TRIES; // reset counter for attempts to login
 			break;
 	}
 }
@@ -829,8 +827,20 @@ void send_test_message(ClientConnection *connection)
 }
 
 
-void parse_client_message(ClientConnection *connection, GString *received_packet)
+bool parse_client_message(ClientConnection *connection, GString *received_packet)
 {
+	// if packet is bigger than allowed in the protocol
+	if (received_packet->len > MAX_PACKET_SIZE) {
+		log_msg(connection, "[[[ Corrupted packet (packet too big) ]]]");
+		return false;
+	}
+
+	// if packet doesn't contain whole opcode
+	if (received_packet->len < sizeof(int)) {
+		log_msg(connection, "[[[ Corrupted packet (no opcode) ]]]");
+		return false;
+	}
+
 	int opcode = *((int *)received_packet->str);
 	char *message = received_packet->str + sizeof(int); // packet without opcode
 
@@ -868,10 +878,13 @@ void parse_client_message(ClientConnection *connection, GString *received_packet
 				} else { // opcode == SAY (private message)
 					send_private_message(connection, user, msg[1]);
 				}
+				g_strfreev(msg);
 			}
-			else
-				printf("Corrupted packet !!\n");
-			g_strfreev(msg);
+			else {
+				g_strfreev(msg);
+				log_msg(connection, "[[[ Corrupted packet (opcode SAY) ]]]");
+				return false;
+			}
 			break;
 		case MSG:
 			send_message(connection, message);
@@ -888,8 +901,11 @@ void parse_client_message(ClientConnection *connection, GString *received_packet
 		case DECLINE:
 			decline_game(connection);
 			break;
-
+		default:
+			log_msg(connection, "[[[ Unknown opcode ]]]");
+			return false;
 	}
+	return true;
 }
 
 
@@ -947,11 +963,13 @@ void handle_connection(ClientConnection *connection)
 	if (!recv_packet(connection->ssl, received_message)) {
 		// message was not received or has length 0
 		remove_ClientConnection(connection);
+		g_string_free(received_message, TRUE);
 		return;
 	}
 
 	// parse message from client
-	parse_client_message(connection, received_message);
+	if (!parse_client_message(connection, received_message))
+		remove_ClientConnection(connection);
 
 	g_string_free(received_message, TRUE);
 	return;

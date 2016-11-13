@@ -1,37 +1,288 @@
-# Programming Assignment 3
-– SSL Chat system
 /*
+ * Programming Assignment 3 – Secured chat application
+ *
  * Team:
  * Einar Örn Gissurarson <einarog05@ru.is>
  * Óskar Örn <oskart10@ru.is>
  * Peter Hostačný <peterh16@ru.is>
  */
 
- The purpose of this project is to create a Chat System, using a Secure Socket Layer protocol.
 
- Protocol Design:
+===============================================================================
 
- We will be using OpenSSL library for any actual SSL implementation and encryption.
- The Chat System will use a Client/Server architecture. Messages will be passed, using ASCII text format, where the maximum size of messages is 1000 bytes.
-
- 6.2. Answers:
- The passwords are stored on the server side, in a hashed form.
- Passwords are stored at... and the salt strings are stored at...
- Clients will send their password over to the server in a plain text format, because the transmission will be encrytped,
- thus nobody can read the password in transit.
+                         =======================
+                         ||     PROTOCOL      ||
+                         =======================
 
 
-possible attacks:
-- generate thousands of users (this could be prevented by solid database of users and allow users to create new "accounts" by another interface ... using captcha + mail verification)
-- spam server by sending too many requests (for example spamming /who) - could be prevented by disabling this command for not authenticated users or put there some limitation - for example, min. 5 seconds delay from last query or disconnect user after spamming detected (by spamming is meant command spamming)
-- spamming in the room - could be prevented limiting users - max. of 5 messages in 5 seconds and detection
+ Our chat application is implemented as a client/server architecture.
+ Designed protocol is very simple - packets consist only of opcode (4 bytes)
+ and data. Opcode is stored in binary form inside packet. Data are created by
+ user and thus it will be probably ASCII sequence of characters but since we
+ didn't want to rely on such an assumption we implemented it in the way it can
+ handle also binary data.
 
+ We use non-blocking sockets for client connections so no client can block
+ the server by stucking at SSL handshake or by any message.
+
+ Server uses select() and complicated internal structure for handling multiple
+ connections. Connections are stored inside double-ended queue (glibc).
+
+ Certificate is self-signed but until we can distribute it to all clients
+ in a secure way, it provides the same level of security as CA-signed
+ certificates do.
+
+ Maximal size of one packet is specified in chat_common.h:
+    #define MAX_PACKET_SIZE 1200
+
+ Detailed description of possible opcodes is bellow. All opcodes are listed
+ inside enumeration types in chat_common.h.
+
+
+ Packet example:
+
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 ...              MAX_PACKET_SIZE
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |opcode |                     data                              |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+
+                     ==============================
+                     || CLIENT_TO_SERVER_OPCODES ||
+                     ==============================
+
+ ### Query packets:
+
+ OPCODE: WHO
+COMMAND: /who   # print list of all users
+ PACKET: <WHO>
+
+ OPCODE: LIST
+COMMAND: /list   # print list of all rooms
+ PACKET: <LIST>
+
+
+ ### Control packets:
+
+ OPCODE: JOIN
+COMMAND: /join <room>   # join the room
+ PACKET: <JOIN> + <room>
+
+ OPCODE: USER
+COMMAND: /user <username>   # log in
+ PACKET: <USER> + <username> + WHITESPACE + <password>
+
+
+ ### Message packets:
+
+ OPCODE: SAY
+COMMAND: /say <username> <msg>   # private message
+ PACKET: <SAY> + <username> + WHITESPACE + <message>
+
+ OPCODE: MSG
+COMMAND: <message>  # room message
+ PACKET: <MSG> + <message>
+
+
+ ### Game packets:
+
+ OPCODE: GAME
+COMMAND: /game <username>   # challenge user to play a game
+ PACKET: <GAME> + <username>
+
+ OPCODE: ROLL
+COMMAND: /roll    # roll a number
+ PACKET: <ROLL>
+
+ OPCODE: ACCEPT
+COMMAND: /roll    # accept game
+ PACKET: <ACCEPT>
+
+ OPCODE: DECLINE
+COMMAND: /decline    # decline game
+ PACKET: <DECLINE>
+
+Commands /bye and /quit just close the connection. No packet is sent to server.
+
+
+                     ==============================
+                     || SERVER_TO_CLIENT_OPCODES ||
+                     ==============================
+
+ OPCODE: ERROR   // error message from server
+ PACKET: <ERROR> + <message>
+
+
+ OPCODE: INFO   // info message from server
+ PACKET: <INFO> + <message>
+
+
+ OPCODE: CHANGE_ROOM   // user's room was successfully changed
+ PACKET: <CHANGE_ROOM> + <room>
+
+
+ OPCODE: LOGGED_IN   // user was successfully logged into existing account
+ PACKET: <LOGGED_IN> + <username>
+
+
+ OPCODE: USER_CREATED   // same as LOGGED_IN but new user was created
+ PACKET: <USER_CREATED> + <username>
+
+
+ OPCODE: ROOM_MESSAGE   // new chat message inside room
+ PACKET: <ROOM_MESSAGE> + <sender_username> + <message>
+
+
+ OPCODE: PRIVATE_MESSAGE_SENT   // notification about delivered message
+                                // sent to the sender
+ PACKET: <PRIVATE_MESSAGE_SENT> + <recipient_username> + " " + <message>
+
+
+ OPCODE: PRIVATE_MESSAGE_RECEIVED   // private message sent to the recipient
+ PACKET: <PRIVATE_MESSAGE_RECEIVED> + <sender_username> + " " + <message>
+
+
+ OPCODE: CHALLENGE   // challenge from another user (game)
+ PACKET: <CHALLENGE> + <challenger>
+
+
+// this opcode is not part of communication protocol
+// it is just for internal use of chat client
+ OPCODE: CLIENT_ERROR   // error message from the client
+ PACKET: <CLIENT_ERROR> + <message>
+
+
+================================================================================
+
+
+6.2. Answers:
+
+ Passwords are stored in a hashed form together with salt strings inside
+ 'passwords.ini' file.
+
+ Client application sends password to the server in a plain text form. Since
+ communication is encrypted, possible eavesdropper cannot retrieve it from
+ packets. He could do that only in the case, he would get access to client's
+ device and replaces the CA certificate before starting client application and
+ do man-in-the-middle attack or get the private key of the server.
+
+ Password is then processed through hash function (openssl/ssl.h:
+ PKCS5_PBKDF2_HMAC_SHA1) together with salt string and result hash string
+ is stored inside passwords file 'passwords.ini' (there is also salt string
+ stored for each password).
+
+ Parameters used for hashing passwords (chat_common.h)
+        #define HASH_ITERATION 10000
+        #define SIZE_OF_HASH 128
+        #define SALT_LENGTH 32
+
+7.2. Answers:
+
+ Question about logging of private messages is in my opinion question about
+ ethics. In this world, where we have enough of memory to store whole
+ communication, so we can decide if we want to have possibility of searching
+ inside history of client's messages. I can imagine that in some countries
+ could be laws/rules for this (example: terrorist group used my server for
+ communication about assassination/attack). In case I am using self-signed
+ certificate even NSA probably cannot see the communication :)
+ Another possibility is log only some "headers" - who communicated with who,
+ what time from what IP (without storing messages).
+
+ After all, this can be included inside Terms of Use and then it is ok to
+ decide how I want.
+
+
+8.2. Answers:
+
+ If we didn't use idle and client would left his device unattended, his good
+ colleagues could post some messges on his behalf. We could use some KEEP-ALIVE
+ packets from client for making sure that idle time out happens on time.
+ These packets would be sent only in case of device activity (moving mouse,
+ typing on keyboard, etc.)
+
+
+9.2. Answers:
+
+ Our server is secure and it is not possible to cheat in this game :D
+ Every check and action is performed by server and server doesn't allow users
+ to use commands in bad order or cheat. Also messages about game (roll numbers,
+ win message) are sent by server and since we made nice colored output, clients
+ can easily differ between messages from other clients and server (example: if
+ somebody loged in as SERVER his name will be grey inside chat, while server's
+ messages are green/red according to their role).
+
+
+================================================================================
+
+
+CHAT CLIENT RESTRICTIONS:
+
+    - Chat client will split message into more messages if it exceed
+      MAX_MESSAGE_SIZE (chat_common.h)
+    - User is forced to use only these characters in username: "A-Za-z0-9._-|"
+
+    - Maximal length of username is MAX_USERNAME_LENGTH (chat_common.h)
+      Maximal length of password is MAX_PASSWORD_LENGTH (chat_common.h)
+      (server uses dynamic data structures for these strings and
+      MAX_PACKET_SIZE so he doesn't have to care about security of this and
+      it is just up to client implementation)
+
+
+SERVER RESTRICTIONS:
+
+    - User is allowed to max. 3 unsuccessful tries
+      MAX_FAILED_PASSWD_TRIES constant (chat_common.h)
+    - User is allowed to try next password after static delay (after failed
+      attempt to login) ... FAILED_LOGIN_DELAY_TIME (chat_common.h)
+    - Client is kicked out by server (connection is closed) in case of:
+        - client sent unknown opcode
+        - client sent packet smaller than size of opcode (4 bytes)
+        - client sent packet bigger than MAX_PACKET_SIZE
+        - client haven't sent any packet for MAX_IDLE_TIME (chat_common.h)
+
+
+SERVER interesting functions:
+    - clean_and_die() // frees memory and ends the application
+    - log_msg() // takes care of all server's logging (printed to output)
+    - send_packet() // takes care of transmitting all outgoing packets
+            If packet was not successfully transmitted, it is added into
+            write queue and server will try to transmit it right after socket
+            is ready.
+    - initialize_openssl() // initialize openssl structures and loads keys
+    - run_loop() // server loop for serving clients
+    - parse_client_message() // parse packet received from a client
+
+
+================================================================================
+
+
+Possible attacks:
+
+    - Generate thousands of users (this could be prevented by solid database
+      of users and force users to create new "accounts" by another interface -
+      either by new command or through some web interface, probably using
+      captcha and/or mail verification.
+
+    - Overload server by sending too many requests/packets (for example
+      spamming /who command).
+      This could be prevented by disabling query commands for not authenticated
+      users and/or use for these commands some limitation -
+      for example min. 5 seconds delay between queries or disconnecting user
+      after detecting such an activity
+
+    - Spamming in the room could be prevented by limiting users for max.
+      of 5 messages in 5 seconds.
+
+
+
+======================
+ Used commands (internal notes)
+======================
 
 - generating private key (-aes128 option for key encrypted by passphrase)
 openssl genrsa -out server.key 2048
 
-
-- generating public key from private key:
+- generating public key from private key (not needed)
 openssl rsa -in server.key -pubout -out server-public.key
 
 - generating certificate
@@ -40,7 +291,7 @@ openssl req -new -x509 -days 365 -key server.key -out server.crt
 - printing info about certificate
 openssl x509 -text -in server.crt -noout
 
-- checking if key matches the certificate
+- checking if key matches the certificate (compare the values)
 openssl x509 -noout -modulus -in server.crt | openssl md5
 openssl rsa -noout -modulus -in server.key | openssl md5
 

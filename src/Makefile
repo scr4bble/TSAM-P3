@@ -33,4 +33,4 @@ run-client:
 	cd ..; ./src/chat 127.0.0.1 $(SERVER_PORT)
 
 zip:
-	cd ..; zip chat.zip README src/*.c src/Makefile AUTHORS
+	cd ..; zip chat.zip README src/*.c src/*.h src/Makefile Makefile AUTHORS server.crt server.key

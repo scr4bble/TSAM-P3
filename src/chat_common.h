@@ -10,11 +10,17 @@
 
 #define MAX_PACKET_SIZE 1200 // maximum size of packet sent by server/client in bytes
 #define MAX_MESSAGE_SIZE 1000 // maximum size of message (private of public/room)
+
 #define MAX_IDLE_TIME 180 // in seconds
+
 #define MAX_USERNAME_LENGTH 32 // characters
 #define MAX_PASSWORD_LENGTH 32 // characters
+#define MAX_FAILED_PASSWD_TRIES 3  // number of tries
+#define FAILED_LOGIN_DELAY_TIME 5  // seconds
+
 #define HASH_ITERATION 10000 // number of iterations of PKCS5_PBKDF2_HMAC_SHA1() for passwords
 #define SIZE_OF_HASH 128 // number of iterations of PKCS5_PBKDF2_HMAC_SHA1() for passwords
+#define SALT_LENGTH 32
 
 
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -48,7 +54,6 @@ typedef enum {
 	JOIN,     //  /join <room>
 	USER,     //  /user <username> <password>    # login
 	SAY,      //  /say <username> <msg>          # private message
-	//BYE,    //  /bye   # maybe just close the connection after this command
 	MSG,      //  <MSG_opcode> <message>
 	GAME,     //  /game <username>
 	ROLL,     //  /roll

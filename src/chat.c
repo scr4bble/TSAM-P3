@@ -164,14 +164,12 @@ void update_prompt()
 {
 	// reset prompt
 	g_string_truncate(prompt, 0);
-
 	if (user) {
 		g_string_append_printf(prompt, "(%s) ", user);
 	}
 	if (chatroom) {
 		g_string_append_printf(prompt, "#%s ", chatroom);
 	}
-
 	g_string_append(prompt, "> ");
 
 	rl_set_prompt(prompt->str);
@@ -228,6 +226,14 @@ bool check_username(const char *username)
 	return true;
 }
 
+void clear_line()
+{
+	rl_set_prompt("");
+	rl_replace_line("", 0);
+	rl_forced_update_display();
+	update_prompt();
+	rl_redisplay();
+}
 
 void print_message(int msg_type, char *sender, char *message)
 {
@@ -274,17 +280,11 @@ void print_message(int msg_type, char *sender, char *message)
 	}
 	print_colored(message, ANSI_COLOR_RESET);
 	printf("\n");
-	rl_forced_update_display();
+
+	if (msg_type != CLIENT_ERROR)
+		clear_line();
 }
 
-
-void clear_line()
-{
-	rl_set_prompt("");
-	rl_replace_line("", 0);
-	rl_redisplay();
-	update_prompt();
-}
 
 
 /* When a line is entered using the readline library, this function
@@ -293,6 +293,7 @@ void clear_line()
    server messages in the loop in main(). */
 void readline_callback(char *line)
 {
+	clear_line();
 	if (NULL == line) {
 		rl_callback_handler_remove();
 		signal_handler(SIGTERM);
@@ -311,10 +312,7 @@ void readline_callback(char *line)
 		int i = 5;
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
-			write(STDOUT_FILENO, "Usage: /game username\n",
-				  29);
-			fsync(STDOUT_FILENO);
-			rl_redisplay();
+			print_message(CLIENT_ERROR, "CLIENT", "Usage: /game username");
 			return;
 		}
 		/* Start game */
@@ -337,9 +335,7 @@ void readline_callback(char *line)
 		/* Skip whitespace */
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
-			write(STDOUT_FILENO, "Usage: /join chatroom\n", 22);
-			fsync(STDOUT_FILENO);
-			rl_redisplay();
+			print_message(CLIENT_ERROR, "CLIENT", "Usage: /join chatroom");
 			return;
 		}
 		const char *room = &(line[i]);
@@ -361,10 +357,7 @@ void readline_callback(char *line)
 		int i = 4;
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
-				write(STDOUT_FILENO, "Usage: /say username message\n",
-					  29);
-				fsync(STDOUT_FILENO);
-				rl_redisplay();
+				print_message(CLIENT_ERROR, "CLIENT", "Usage: /say username message");
 				return;
 		}
 		int j = i;
@@ -372,10 +365,7 @@ void readline_callback(char *line)
 		/* detect start of the message */
 		while (line[j] != '\0' && isgraph(line[j])) { j++; }
 		if (line[j] == '\0') {
-				write(STDOUT_FILENO, "Usage: /say username message\n",
-					  29);
-				fsync(STDOUT_FILENO);
-				rl_redisplay();
+				print_message(CLIENT_ERROR, "CLIENT", "Usage: /say username message");
 				return;
 		}
 		char *receiver = strndup(&(line[i]), j - i);
@@ -401,9 +391,8 @@ void readline_callback(char *line)
 		/* Skip whitespace */
 		while (line[i] != '\0' && isspace(line[i])) { i++; }
 		if (line[i] == '\0') {
-				write(STDOUT_FILENO, "Usage: /user username\n", 22);
-				fsync(STDOUT_FILENO);
-				rl_redisplay();
+				print_message(CLIENT_ERROR, "CLIENT", "Usage: /user username");
+
 				return;
 		}
 		const char *new_user = &(line[i]);
@@ -411,7 +400,6 @@ void readline_callback(char *line)
 			char error_message[512];
 			sprintf(error_message, "Username can contain only \"A-Za-z0-9._-|\" and must be max. %d characters long.", MAX_USERNAME_LENGTH);
 			print_message(CLIENT_ERROR, "CLIENT", error_message);
-			clear_line();
 			return;
 		}
 
@@ -422,7 +410,6 @@ void readline_callback(char *line)
 			char error_message[512];
 			sprintf(error_message, "Password must be max. %d characters long.", MAX_PASSWORD_LENGTH);
 			print_message(CLIENT_ERROR, "CLIENT", error_message);
-			clear_line();
 			return;
 		}
 
@@ -439,7 +426,6 @@ void readline_callback(char *line)
 	}
 	if (strncmp("/", line, 1) == 0) {
 		print_message(CLIENT_ERROR, "CLIENT", "Unknown command.");
-		clear_line();
 		return;
 	}
 	/* Sent the buffer to the server. */
@@ -645,8 +631,9 @@ int main(int argc, char **argv) {
 	}
 
 
-	update_prompt();
+	clear_line();
 	rl_callback_handler_install(prompt->str, (rl_vcpfunc_t*) &readline_callback);
+	rl_erase_empty_line = 42; // do no print out empty line from readline
 	for (;;) {
 		fd_set rfds;
 		//struct timeval timeout;
@@ -675,12 +662,6 @@ int main(int argc, char **argv) {
 		}
 		if (r == 0) { // timeout
 			// since timeout is not implemented, this should not happen
-
-			//write(STDOUT_FILENO, "No message?\n", 12);
-			//fsync(STDOUT_FILENO);
-			/* Whenever you print out a message, call this
-			   to reprint the current input line. */
-			rl_redisplay();
 			continue;
 		}
 		if (FD_ISSET(exitfd[0], &rfds)) {
